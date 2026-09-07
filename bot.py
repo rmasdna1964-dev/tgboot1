@@ -48,7 +48,7 @@ dp = Dispatcher()
 
 
 # ============================================================
-# ПАМЯТЬ БОТА (СЕКРЕТАРЯ)
+# ПАМЯТЬ БОТА
 # ============================================================
 
 business_owners: Dict[str, int] = {}
@@ -58,6 +58,7 @@ active_games: Dict[int, Dict[str, Any]] = {}
 active_trolls: Dict[int, bool] = {}
 is_ghouling: Dict[int, bool] = {}
 notes: Dict[int, list] = {}
+active_spams: Dict[int, bool] = {}
 
 
 # ============================================================
@@ -147,7 +148,6 @@ async def send_reply(
     connection_id: Optional[str] = None,
     reply_markup: Optional[InlineKeyboardMarkup] = None
 ):
-    """Отправка от имени аккаунта (если передано connection_id)."""
     kwargs = {"chat_id": chat_id, "text": text}
     if reply_markup:
         kwargs["reply_markup"] = reply_markup
@@ -217,7 +217,7 @@ async def finish_rps(chat_id: int):
 
 
 # ============================================================
-# ЧЁТКАЯ ЛОГИКА СЕКРЕТАРЯ И КОМАНД
+# ЛОГИКА СЕКРЕТАРЯ И СПАМА
 # ============================================================
 
 async def handle_secretary_logic(message: Message, is_owner: bool, connection_id: Optional[str] = None):
@@ -225,18 +225,36 @@ async def handle_secretary_logic(message: Message, is_owner: bool, connection_id
     chat_id = message.chat.id
     lower = text.lower()
 
-    # 1. ЕСЛИ ПИШЕТ ВЛАДЕЛЕЦ — ВЫПОЛНЯЕМ КОМАНДЫ (АВТООТВЕТЧИК НЕ СРАБАТЫВАЕТ)
+    # 1. ЕСЛИ ПИШЕТ ВЛАДЕЛЕЦ
     if is_owner:
+        # КОМАНДА БЕСКОНЕЧНОГО СПАМА (.spam текст)
         if lower.startswith(".spam"):
             parts = text.split(maxsplit=1)
             if len(parts) < 2:
-                await send_reply(chat_id, "❌ Укажите текст: <code>.spam Текст автоответчика</code>", connection_id)
+                await send_reply(chat_id, "❌ Укажи текст: <code>.spam слово</code>", connection_id)
                 return
+
             spam_text = parts[1].strip()
-            autoresponders[chat_id] = {"enabled": True, "text": spam_text}
-            await send_reply(chat_id, f"🤖 <b>Секретарь включён!</b>\n\nБуду отвечать людям:\n<blockquote>{spam_text}</blockquote>", connection_id)
+            active_spams[chat_id] = True
+
+            async def run_spam():
+                while active_spams.get(chat_id, False):
+                    try:
+                        await send_reply(chat_id, spam_text, connection_id)
+                    except Exception as e:
+                        logging.error(f"Пауза из-за ограничения Telegram: {e}")
+                        await asyncio.sleep(0.5)
+
+            asyncio.create_task(run_spam())
             return
 
+        # ОСТАНОВКА СПАМА (.stop)
+        if lower == ".stop":
+            active_spams[chat_id] = False
+            await send_reply(chat_id, "🛑 <b>Спам остановлен.</b>", connection_id)
+            return
+
+        # ИНФО О ПОЛЬЗОВАТЕЛЕ (.info)
         if lower == ".info":
             user = message.from_user
             username = f"@{user.username}" if user and user.username else "нет"
@@ -250,10 +268,12 @@ async def handle_secretary_logic(message: Message, is_owner: bool, connection_id
             await send_reply(chat_id, info_text, connection_id)
             return
 
+        # ЗАПУСК КНБ (.starts)
         if lower == ".starts":
             await start_rps(chat_id, connection_id)
             return
 
+        # РЕЖИМ GHOUL (.ghoul / .ghoulstop)
         if lower == ".ghoul":
             is_ghouling[chat_id] = True
             await send_reply(chat_id, "👻 <b>Режим Ghoul включён.</b>", connection_id)
@@ -264,11 +284,13 @@ async def handle_secretary_logic(message: Message, is_owner: bool, connection_id
             await send_reply(chat_id, "👻 <b>Режим Ghoul выключен.</b>", connection_id)
             return
 
+        # ТРОЛЛЬ-РЕЖИМ (.a_troll)
         if lower == ".a_troll":
             active_trolls[chat_id] = True
             await send_reply(chat_id, "😈 <b>Тролль-режим включён.</b>", connection_id)
             return
 
+        # ЗАМЕТКИ (.note / .get)
         if lower.startswith(".note"):
             parts = text.split(maxsplit=1)
             if len(parts) >= 2:
@@ -282,10 +304,9 @@ async def handle_secretary_logic(message: Message, is_owner: bool, connection_id
             await send_reply(chat_id, out, connection_id)
             return
 
-        # Если владелец просто пишет обычный текст — ничего не делаем (не перебиваем)
         return
 
-    # 2. ЕСЛИ ПИШЕТ СОБЕСЕДНИК — ВКЛЮЧАЕТСЯ СЕКРЕТАРЬ / АВТООТВЕТЧИК
+    # 2. ЕСЛИ ПИШЕТ СОБЕСЕДНИК (АВТООТВЕТЧИК И РЕЖИМЫ)
     ar = autoresponders.get(chat_id)
     if ar and ar.get("enabled") and ar.get("text"):
         try:
@@ -333,7 +354,8 @@ async def panel_help(callback: CallbackQuery):
     await callback.answer()
     text = (
         "ℹ️ <b>Команды Владельца:</b>\n\n"
-        "<code>.spam текст</code> — установить автоответчик людям\n"
+        "<code>.spam слово</code> — бесконечный спам сообщением\n"
+        "<code>.stop</code> — остановить спам\n"
         "<code>.info</code> — инфо о собеседнике\n"
         "<code>.starts</code> — начать КНБ\n"
         "<code>.ghoul</code> — режим ghoul\n"
@@ -473,7 +495,7 @@ async def private_message_handler(message: Message):
     if await dp.storage.get_state(bot=bot, key=message.chat.id):
         return
 
-    is_owner = (OWNER_ID != 0 and message.from_user.id == OWNER_ID) or (OWNER_ID == 0)
+    is_owner = (OWNER_ID == 0) or (message.from_user and message.from_user.id == OWNER_ID)
     await handle_secretary_logic(message, is_owner=is_owner)
 
 
@@ -484,12 +506,13 @@ async def business_message_handler(message: Message):
         return
 
     connection = await get_connection_info(connection_id)
-    if not connection or message.sender_business_bot:
+    if not connection:
         return
 
     owner_id = connection.user.id
     sender_id = message.from_user.id if message.from_user else None
-    is_owner = (sender_id == owner_id)
+    
+    is_owner = (sender_id == owner_id) or (OWNER_ID != 0 and sender_id == OWNER_ID)
 
     await handle_secretary_logic(message, is_owner=is_owner, connection_id=connection_id)
 
