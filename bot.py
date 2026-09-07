@@ -43,7 +43,7 @@ async def cmd_start(message: Message):
     text = (
         "👋 **Бот активен!**\n\n"
         "Доступные команды:\n"
-        "• `.spam <текст>` — Запустить спам (остановка: `.stop`)\n"
+        "• `.spam <текст>` — Запустить спам с интервалом 3 сек (остановка: `.stop`)\n"
         "• `.play` — Сыграть в Камень, Ножницы, Бумага"
     )
     await message.answer(text, parse_mode="Markdown")
@@ -136,7 +136,7 @@ async def handle_commands(chat_id: int, text: str, business_conn_id: str = None)
             while is_spamming.get(chat_id, False):
                 try:
                     await send_msg(msg)
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(3.0)  # Интервал отправки отправки 3 секунды
                 except Exception as e:
                     logging.error(f"Ошибка при спаме: {e}")
                     break
