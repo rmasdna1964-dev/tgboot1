@@ -4,180 +4,168 @@ import os
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
-from aiogram.types import (
-    Message,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    CallbackQuery
-)
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# ============================================================
-# НАСТРОЙКИ И АВТОМАТИЧЕСКАЯ ПОДСТАНОВКА ТОКЕНА
-# ============================================================
+# Настройки и токен
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8872260684:AAHEhMfCuLTfG0RK1kjmqUmDS-TXRiQUWzk").strip()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8955553619:AAGPRoVXir741kBwfYcGg6GlJhI4WzezK2Y").strip()
-
-# Инициализация бота с верным именованным аргументом 'token'
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# Состояние активных спам-процессов: {chat_id: bool}
-active_spams = {}
+# Глобальные переменные
+is_spamming = {}
+active_games = {}
 
-class SpamState(StatesGroup):
-    waiting_for_target = State()
-    waiting_for_text = State()
-    confirm_spam = State()
+# --- КЛАВИАТУРЫ ДЛЯ КНБ ---
 
-# ============================================================
-# КЛАВИАТУРЫ
-# ============================================================
-
-def get_main_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🚀 Запустить спам", callback_data="start_spam_flow")],
-            [InlineKeyboardButton(text="🛑 Остановить текущий спам", callback_data="stop_spam")],
-            [InlineKeyboardButton(text="📖 Инструкция", callback_data="show_instruction")]
+def get_rps_keyboard(chat_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🗿 Камень", callback_data=f"rps_rock_{chat_id}"),
+            InlineKeyboardButton(text="✂️ Ножницы", callback_data=f"rps_scissors_{chat_id}"),
+            InlineKeyboardButton(text="📄 Бумага", callback_data=f"rps_paper_{chat_id}")
         ]
-    )
+    ])
 
-def get_confirm_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Пуск", callback_data="confirm_start"),
-                InlineKeyboardButton(text="❌ Отклонить", callback_data="cancel_spam")
-            ]
+def get_post_game_keyboard(chat_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🎮 Сыграть ещё раз", callback_data=f"rps_restart_{chat_id}"),
+            InlineKeyboardButton(text="❌ Завершить", callback_data=f"rps_cancel_{chat_id}")
         ]
-    )
+    ])
 
-def get_cancel_only_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_spam")]
-        ]
-    )
-
-# ============================================================
-# ОБРАБОТКА МЕНЮ И FSM
-# ============================================================
+# --- КОМАНДА /start ---
 
 @dp.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer(
-        "👋 **Главное меню управления**\n\nВыбери нужное действие ниже:",
-        reply_markup=get_main_keyboard(),
-        parse_mode="Markdown"
-    )
-
-@dp.callback_query(F.data == "show_instruction")
-async def show_instruction(callback: CallbackQuery):
+async def cmd_start(message: Message):
     text = (
-        "📖 **Инструкция по настройке и работе:**\n\n"
-        "1️⃣ **Telegram Business (Подключение к ЛС):**\n"
-        "• Открой Настройки Telegram ➔ **Telegram для бизнеса**.\n"
-        "• Перейди в раздел **Чат-боты** и добавь этого бота.\n"
-        "• Выбери «Все чаты», чтобы бот мог отправлять сообщения от твоего имени.\n\n"
-        "2️⃣ **Запуск спама из меню:**\n"
-        "• Нажми кнопку **«🚀 Запустить спам»**.\n"
-        "• Введи `@username` или `ID` цели.\n"
-        "• Введи текст сообщения.\n"
-        "• Подтверди запуск кнопкой **«✅ Пуск»**.\n\n"
-        "3️⃣ **Остановка:**\n"
-        "• В любой момент нажми **«🛑 Остановить текущий спам»**."
+        "👋 **Бот активен!**\n\n"
+        "Доступные команды:\n"
+        "• `.spam <текст>` — Запустить спам (остановка: `.stop`)\n"
+        "• `.play` — Сыграть в Камень, Ножницы, Бумага"
     )
-    await callback.message.edit_text(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
-    await callback.answer()
+    await message.answer(text, parse_mode="Markdown")
 
-@dp.callback_query(F.data == "start_spam_flow")
-async def start_spam_flow(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(SpamState.waiting_for_target)
-    await callback.message.edit_text(
-        "👤 **Шаг 1 из 2:**\nВведи **Username** (например `@username`) или **ID** человека, которому нужно отправлять сообщения:",
-        reply_markup=get_cancel_only_keyboard(),
-        parse_mode="Markdown"
-    )
-    await callback.answer()
+# --- ОБРАБОТЧИКИ КЛИКОВ КНБ ---
 
-@dp.message(SpamState.waiting_for_target)
-async def process_target(message: Message, state: FSMContext):
-    target = message.text.strip()
-    await state.update_data(target=target)
-    await state.set_state(SpamState.waiting_for_text)
-    await message.answer(
-        f"💬 **Шаг 2 из 2:**\nЦель: `{target}`\n\nТеперь напиши **текст сообщения** для спама:",
-        reply_markup=get_cancel_only_keyboard(),
-        parse_mode="Markdown"
-    )
+@dp.callback_query(lambda c: c.data and (c.data.startswith("rps_restart_") or c.data.startswith("rps_cancel_")))
+async def process_post_game_actions(callback_query: CallbackQuery):
+    parts = callback_query.data.split("_")
+    action, chat_id = parts[1], int(parts[2])
 
-@dp.message(SpamState.waiting_for_text)
-async def process_text(message: Message, state: FSMContext):
-    spam_text = message.text.strip()
-    await state.update_data(spam_text=spam_text)
-    
-    data = await state.get_data()
-    target = data.get("target")
-    
-    await state.set_state(SpamState.confirm_spam)
-    await message.answer(
-        f"⚙️ **Подтверждение запуска:**\n\n"
-        f"🎯 **Цель:** `{target}`\n"
-        f"📝 **Текст:** {spam_text}\n\n"
-        f"Нажми **«Пуск»** для начала или **«Отклонить»** для отмены.",
-        reply_markup=get_confirm_keyboard(),
-        parse_mode="Markdown"
-    )
-
-@dp.callback_query(F.data == "confirm_start", SpamState.confirm_spam)
-async def confirm_start(callback: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    target = data.get("target")
-    spam_text = data.get("spam_text")
-    await state.clear()
-
-    chat_id = callback.message.chat.id
-    active_spams[chat_id] = True
-
-    await callback.message.edit_text(
-        f"🚀 **Спам запущен!**\nЦель: `{target}`\n\nДля остановки нажми кнопку ниже.",
-        reply_markup=get_main_keyboard(),
-        parse_mode="Markdown"
-    )
-    await callback.answer()
-
-    for _ in range(50):
-        if not active_spams.get(chat_id, False):
-            break
+    if action == "restart":
+        active_games[chat_id] = {"choices": {}}
+        await callback_query.message.edit_text("🎮 **Камень, ножницы, бумага! Сделайте выбор:**", reply_markup=get_rps_keyboard(chat_id))
+    elif action == "cancel":
+        if chat_id in active_games:
+            del active_games[chat_id]
         try:
-            await bot.send_message(chat_id=target, text=spam_text)
-            await asyncio.sleep(0.2)
-        except Exception as e:
-            await callback.message.answer(f"❌ Ошибка отправки на `{target}`: {e}")
-            break
+            await callback_query.message.delete()
+        except Exception:
+            await callback_query.message.edit_text("❌ Игра завершена.")
 
-    active_spams[chat_id] = False
+@dp.callback_query(lambda c: c.data and c.data.startswith("rps_"))
+async def process_rps_choice(callback_query: CallbackQuery):
+    parts = callback_query.data.split("_")
+    choice, chat_id = parts[1], int(parts[2])
+    user_id, user_name = callback_query.from_user.id, callback_query.from_user.first_name
 
-@dp.callback_query(F.data == "cancel_spam")
-async def cancel_spam(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.edit_text("❌ **Операция отменена.**", reply_markup=get_main_keyboard(), parse_mode="Markdown")
-    await callback.answer("Отменено")
+    if chat_id not in active_games:
+        await callback_query.answer("Игра не найдена. Напишите .play", show_alert=True)
+        return
 
-@dp.callback_query(F.data == "stop_spam")
-async def stop_spam(callback: CallbackQuery):
-    chat_id = callback.message.chat.id
-    active_spams[chat_id] = False
-    await callback.message.answer("🛑 **Запрос на остановку отправлен.**")
-    await callback.answer()
+    game = active_games[chat_id]
+    game["choices"][user_id] = {"choice": choice, "name": user_name}
+    await callback_query.answer(f"Вы выбрали {choice.upper()}!")
 
-# ============================================================
-# ЗАПУСК
-# ============================================================
+    if len(game["choices"]) >= 2:
+        await callback_query.message.edit_text("⏳ Подсчитываем результаты...")
+        await asyncio.sleep(1)
+        players = list(game["choices"].values())
+        p1, p2 = players[0], players[1]
+        c1, c2 = p1["choice"], p2["choice"]
+
+        if c1 == c2:
+            result = "🤝 **Ничья!**"
+        elif (c1 == "rock" and c2 == "scissors") or (c1 == "scissors" and c2 == "paper") or (c1 == "paper" and c2 == "rock"):
+            result = f"🏆 Победил **{p1['name']}**!"
+        else:
+            result = f"🏆 Победил **{p2['name']}**!"
+
+        choices_ru = {"rock": "🗿 Камень", "scissors": "✂️ Ножницы", "paper": "📄 Бумага"}
+        res_text = (
+            f"🎮 **Результаты игры:**\n\n"
+            f"👤 **{p1['name']}**: {choices_ru.get(c1, c1)}\n"
+            f"👤 **{p2['name']}**: {choices_ru.get(c2, c2)}\n\n"
+            f"{result}"
+        )
+        await callback_query.message.edit_text(res_text, reply_markup=get_post_game_keyboard(chat_id), parse_mode="Markdown")
+
+# --- ОБРАБОТЧИК ЛОГИКИ TELEGRAM BUSINESS И ОБЫЧНЫХ СООБЩЕНИЙ ---
+
+async def handle_commands(chat_id: int, text: str, business_conn_id: str = None):
+    global is_spamming, active_games
+
+    async def send_msg(msg_text: str, **kwargs):
+        if business_conn_id:
+            await bot.send_message(chat_id=chat_id, text=msg_text, business_connection_id=business_conn_id, **kwargs)
+        else:
+            await bot.send_message(chat_id=chat_id, text=msg_text, **kwargs)
+
+    if text.startswith("."):
+        # Команда .play (Камень, Ножницы, Бумага)
+        if text == ".play":
+            active_games[chat_id] = {"choices": {}}
+            await send_msg(
+                "🎮 **Дуэль: Камень, ножницы, бумага!**\nДва игрока должны выбрать фигуру:",
+                reply_markup=get_rps_keyboard(chat_id),
+                parse_mode="Markdown"
+            )
+            return True
+
+        # Команда .spam <текст>
+        if text.startswith(".spam"):
+            msg = text[5:].strip()
+            if not msg:
+                await send_msg("❌ **Укажите текст:**\n`.spam Текст сообщения`", parse_mode="Markdown")
+                return True
+
+            is_spamming[chat_id] = True
+            while is_spamming.get(chat_id, False):
+                try:
+                    await send_msg(msg)
+                    await asyncio.sleep(0.3)
+                except Exception as e:
+                    logging.error(f"Ошибка при спаме: {e}")
+                    break
+            return True
+
+        # Команда .stop для остановки спама
+        if text == ".stop":
+            is_spamming[chat_id] = False
+            await send_msg("🛑 **Спам остановлен.**", parse_mode="Markdown")
+            return True
+
+    return False
+
+@dp.business_message()
+async def handle_business_message(message: Message):
+    chat_id = message.chat.id
+    text = (message.text or "").strip()
+    conn_id = message.business_connection_id
+
+    if conn_id:
+        await handle_commands(chat_id, text, business_conn_id=conn_id)
+
+@dp.message(F.text)
+async def handle_regular_message(message: Message):
+    chat_id = message.chat.id
+    text = (message.text or "").strip()
+    await handle_commands(chat_id, text)
+
+# --- ЗАПУСК ---
 
 async def main():
     logging.basicConfig(level=logging.INFO)
@@ -185,7 +173,4 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("Бот остановлен.")
+    asyncio.run(main())
