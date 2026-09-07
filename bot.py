@@ -21,13 +21,7 @@ from supabase import create_client, Client
 # НАСТРОЙКИ
 # ============================================================
 
-# Получаем токен из переменных окружения (GitHub Secrets / .env)
-# Очищаем от возможных случайных пробелов или переносов строк
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-
-# Если переменной окружения нет, подставьте ваш новый токен сюда между кавычек:
-if not BOT_TOKEN:
-    BOT_TOKEN = "8955553619:AAHp0wVte0cE5-fz9qcf3vG9GEeuB7II8Pc".strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8955553619:AAHqVdxHL8l_8VnhbjEwp8Nr3Sp6ddquX-E").strip()
 
 SUPABASE_URL = "https://uzdorwhlwihwhvnedwkj.supabase.co"
 SUPABASE_KEY = "sb_publishable_GvTORvdPKyFzSp3Kjlx2HA_9OBY9xx-"
@@ -124,7 +118,7 @@ async def get_or_create_user(user_id: int, username: str):
 
 
 # ============================================================
-# ГЛАВНАЯ ПАНЕЛЬ
+# КЛАВИАТУРЫ
 # ============================================================
 
 def get_main_keyboard():
@@ -152,10 +146,6 @@ def get_confirm_turnoff_keyboard():
     )
 
 
-# ============================================================
-# КАМЕНЬ НОЖНИЦЫ БУМАГА
-# ============================================================
-
 def get_rps_keyboard(chat_id: int):
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -178,7 +168,7 @@ def get_post_game_keyboard(chat_id: int):
 
 
 # ============================================================
-# /START
+# /START & ПАНЕЛЬ
 # ============================================================
 
 @dp.message(CommandStart())
@@ -202,7 +192,7 @@ async def cmd_start(message: Message, state: FSMContext):
 
 
 # ============================================================
-# АВТООТВЕТЧИК
+# АВТООТВЕТЧИК CALLBACKS
 # ============================================================
 
 @dp.callback_query(F.data == "toggle_ar_panel")
@@ -277,20 +267,18 @@ async def show_game_info(callback: CallbackQuery):
 # ИГРА КНБ
 # ============================================================
 
-async def start_rps_game(chat_id: int, business_connection_id: str):
+async def start_rps_game(chat_id: int, business_connection_id: str = None):
     active_games[chat_id] = {
         "choices": {},
         "business_connection_id": business_connection_id,
         "finished": False
     }
 
-    await bot.send_message(
-        chat_id=chat_id,
-        text="🎮 **КАМЕНЬ • НОЖНИЦЫ • БУМАГА**\n\n👥 Игроков готово: **(0/2)**\n\nСделайте свой выбор ниже:",
-        reply_markup=get_rps_keyboard(chat_id),
-        business_connection_id=business_connection_id,
-        parse_mode="Markdown"
-    )
+    kwargs = {"chat_id": chat_id, "text": "🎮 **КАМЕНЬ • НОЖНИЦЫ • БУМАГА**\n\n👥 Игроков готово: **(0/2)**\n\nСделайте свой выбор ниже:", "reply_markup": get_rps_keyboard(chat_id), "parse_mode": "Markdown"}
+    if business_connection_id:
+        kwargs["business_connection_id"] = business_connection_id
+
+    await bot.send_message(**kwargs)
 
 
 def get_winner(choice1, choice2):
@@ -323,16 +311,15 @@ async def finish_rps_game(chat_id: int):
     player2_id, player2 = players[1]
     c1, c2 = player1["choice"], player2["choice"]
 
-    await bot.send_message(
-        chat_id=chat_id,
-        text="⏳ **Все игроки готовы!** Подсчитываем результат (2 сек)...",
-        business_connection_id=game["business_connection_id"],
-        parse_mode="Markdown"
-    )
+    conn_id = game.get("business_connection_id")
+    kwargs_wait = {"chat_id": chat_id, "text": "⏳ **Все игроки готовы!** Подсчитываем результат (2 сек)...", "parse_mode": "Markdown"}
+    if conn_id:
+        kwargs_wait["business_connection_id"] = conn_id
 
+    await bot.send_message(**kwargs_wait)
     await asyncio.sleep(2)
-    winner = get_winner(c1, c2)
 
+    winner = get_winner(c1, c2)
     if winner == 0:
         result = "🤝 **НИЧЬЯ!**"
     elif winner == 1:
@@ -341,14 +328,11 @@ async def finish_rps_game(chat_id: int):
         result = f"🏆 Победил **{player2['name']}**!"
 
     text = f"🎮 **РЕЗУЛЬТАТ ИГРЫ**\n\n👤 {player1['name']}: {CHOICE_NAMES[c1]}\n👤 {player2['name']}: {CHOICE_NAMES[c2]}\n\n{result}"
+    kwargs_res = {"chat_id": chat_id, "text": text, "reply_markup": get_post_game_keyboard(chat_id), "parse_mode": "Markdown"}
+    if conn_id:
+        kwargs_res["business_connection_id"] = conn_id
 
-    await bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        reply_markup=get_post_game_keyboard(chat_id),
-        business_connection_id=game["business_connection_id"],
-        parse_mode="Markdown"
-    )
+    await bot.send_message(**kwargs_res)
 
 
 @dp.callback_query(F.data.startswith("rps_"))
@@ -389,21 +373,18 @@ async def process_rps_choice(callback: CallbackQuery):
 
     await callback.answer(f"Твой выбор: {CHOICE_NAMES[choice]}")
 
+    conn_id = game.get("business_connection_id")
+
     if count == 1:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"🎮 **Дуэль: Камень, ножницы, бумага!**\n\nИгрок **{user_name}** сделал ход!\nСтатус: **(1/2 игроков готово)**\nОжидаем второго игрока...",
-            reply_markup=get_rps_keyboard(chat_id),
-            business_connection_id=game["business_connection_id"],
-            parse_mode="Markdown"
-        )
+        kwargs = {"chat_id": chat_id, "text": f"🎮 **Дуэль: Камень, ножницы, бумага!**\n\nИгрок **{user_name}** сделал ход!\nСтатус: **(1/2 игроков готово)**\nОжидаем второго игрока...", "reply_markup": get_rps_keyboard(chat_id), "parse_mode": "Markdown"}
+        if conn_id:
+            kwargs["business_connection_id"] = conn_id
+        await bot.send_message(**kwargs)
     elif count == 2:
-        await bot.send_message(
-            chat_id=chat_id,
-            text="✅ **(2/2 игроков готово!)**\n\nПодводим итоги...",
-            business_connection_id=game["business_connection_id"],
-            parse_mode="Markdown"
-        )
+        kwargs = {"chat_id": chat_id, "text": "✅ **(2/2 игроков готово!)**\n\nПодводим итоги...", "parse_mode": "Markdown"}
+        if conn_id:
+            kwargs["business_connection_id"] = conn_id
+        await bot.send_message(**kwargs)
         asyncio.create_task(finish_rps_game(chat_id))
 
 
@@ -416,24 +397,9 @@ async def restart_rps(callback: CallbackQuery):
         return
 
     old_game = active_games.get(chat_id)
-    if not old_game:
-        await callback.answer("Игра не найдена.", show_alert=True)
-        return
+    conn_id = old_game.get("business_connection_id") if old_game else None
 
-    business_connection_id = old_game["business_connection_id"]
-    active_games[chat_id] = {
-        "choices": {},
-        "business_connection_id": business_connection_id,
-        "finished": False
-    }
-
-    await bot.send_message(
-        chat_id=chat_id,
-        text="🎮 **НОВАЯ ИГРА!**\n\n👥 Игроков готово: **(0/2)**\n\nВыберите вариант:",
-        reply_markup=get_rps_keyboard(chat_id),
-        business_connection_id=business_connection_id,
-        parse_mode="Markdown"
-    )
+    await start_rps_game(chat_id, conn_id)
     await callback.answer("Новая игра создана!")
 
 
@@ -453,35 +419,30 @@ async def cancel_rps(callback: CallbackQuery):
 
 
 # ============================================================
-# BUSINESS MESSAGE
+# ЕДИНАЯ ЛОГИКА КОМАНД И ОБРАБОТКИ
 # ============================================================
 
-@dp.business_message()
-async def handle_business_message(message: Message):
+async def handle_custom_logic(chat_id: int, user_id: int, text: str, is_business: bool = False, business_connection_id: str = None):
     global spam_text
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-    text = (message.text or "").strip()
-    business_connection_id = message.business_connection_id
 
-    if not business_connection_id:
-        return
+    async def send_msg(msg_text: str, **kwargs):
+        if is_business and business_connection_id:
+            await bot.send_message(chat_id=chat_id, text=msg_text, business_connection_id=business_connection_id, **kwargs)
+        else:
+            await bot.send_message(chat_id=chat_id, text=msg_text, **kwargs)
 
-    is_me = user_id != chat_id
-    is_partner = not is_me
-
-    # Команды владельца
-    if is_me and text.startswith("."):
+    # Команды через точку
+    if text.startswith("."):
         if text.startswith(".spam"):
             args = text[5:].strip()
             if not args:
                 msg = f"⚡ **Текущий `.spam`:**\n\n{spam_text}" if spam_text else "⚡ `.spam` ещё не настроен.\n\nПример:\n`.spam 55`"
-                await bot.send_message(chat_id=chat_id, text=msg, business_connection_id=business_connection_id, parse_mode="Markdown")
-                return
+                await send_msg(msg, parse_mode="Markdown")
+                return True
 
             spam_text = args
-            await bot.send_message(chat_id=chat_id, text=f"✅ **`.spam` установлен!**\n\nТеперь ответ:\n{spam_text}", business_connection_id=business_connection_id, parse_mode="Markdown")
-            return
+            await send_msg(f"✅ **`.spam` установлен!**\n\nТеперь ответ:\n{spam_text}", parse_mode="Markdown")
+            return True
 
         if text == ".info":
             chat = await bot.get_chat(chat_id)
@@ -497,65 +458,88 @@ async def handle_business_message(message: Message):
                 f"🔗 Username: {username}\n"
                 f"💬 Тип чата: `{chat.type}`"
             )
-            await bot.send_message(chat_id=chat_id, text=info_text, business_connection_id=business_connection_id, parse_mode="Markdown")
-            return
+            await send_msg(info_text, parse_mode="Markdown")
+            return True
 
         if text == ".ghoulstop":
             is_ghouling[chat_id] = False
-            await bot.send_message(chat_id=chat_id, text="🛑 **Цикл 1000-7 остановлен.**", business_connection_id=business_connection_id, parse_mode="Markdown")
-            return
+            await send_msg("🛑 **Цикл 1000-7 остановлен.**", parse_mode="Markdown")
+            return True
 
         if text == ".ghoul":
             if is_ghouling.get(chat_id, False):
-                return
+                return True
             is_ghouling[chat_id] = True
             value = 1000
             while value > 0 and is_ghouling.get(chat_id, False):
-                await bot.send_message(chat_id=chat_id, text=f"{value} - 7 = {value - 7}", business_connection_id=business_connection_id)
+                await send_msg(f"{value} - 7 = {value - 7}")
                 value -= 7
                 await asyncio.sleep(0.3)
             is_ghouling[chat_id] = False
-            return
+            return True
 
         if text == ".a_troll":
             current = active_trolls.get(chat_id, False)
             active_trolls[chat_id] = not current
             status = "включён 🎭" if active_trolls[chat_id] else "выключен 🛑"
-            await bot.send_message(chat_id=chat_id, text=f"🎭 Авто-троллинг **{status}**", business_connection_id=business_connection_id, parse_mode="Markdown")
-            return
+            await send_msg(f"🎭 Авто-троллинг **{status}**", parse_mode="Markdown")
+            return True
 
         if text.startswith(".note"):
             args = text[5:].strip().split(maxsplit=1)
             if len(args) != 2:
-                await bot.send_message(chat_id=chat_id, text="❌ Использование:\n`.note имя текст`", business_connection_id=business_connection_id, parse_mode="Markdown")
-                return
+                await send_msg("❌ Использование:\n`.note имя текст`", parse_mode="Markdown")
+                return True
             name, note_text = args[0].lower(), args[1]
             notes[name] = note_text
-            await bot.send_message(chat_id=chat_id, text=f"📌 Заметка **{name}** сохранена.", business_connection_id=business_connection_id, parse_mode="Markdown")
-            return
+            await send_msg(f"📌 Заметка **{name}** сохранена.", parse_mode="Markdown")
+            return True
 
         if text.startswith(".get"):
             name = text[4:].strip().lower()
             if not name:
-                await bot.send_message(chat_id=chat_id, text="❌ Использование:\n`.get имя`", business_connection_id=business_connection_id, parse_mode="Markdown")
-                return
+                await send_msg("❌ Использование:\n`.get имя`", parse_mode="Markdown")
+                return True
             result = notes.get(name, f"❌ Заметка **{name}** не найдена.")
-            await bot.send_message(chat_id=chat_id, text=result, business_connection_id=business_connection_id, parse_mode="Markdown")
-            return
+            await send_msg(result, parse_mode="Markdown")
+            return True
 
         if text == ".starts":
             await start_rps_game(chat_id, business_connection_id)
-            return
+            return True
 
-    # Входящие сообщения собеседника
-    if is_partner:
-        if autoresponder["active"] and message.chat.type == "private":
-            await bot.send_message(chat_id=chat_id, text=autoresponder["text"], business_connection_id=business_connection_id)
-        elif spam_text:
-            await bot.send_message(chat_id=chat_id, text=spam_text, business_connection_id=business_connection_id)
+    # Реакция на входящие сообщения
+    if autoresponder["active"]:
+        await send_msg(autoresponder["text"])
+    elif spam_text:
+        await send_msg(spam_text)
 
-        if active_trolls.get(chat_id, False):
-            await bot.send_message(chat_id=chat_id, text=random.choice(TROLL_PHRASES), business_connection_id=business_connection_id)
+    if active_trolls.get(chat_id, False):
+        await send_msg(random.choice(TROLL_PHRASES))
+
+    return False
+
+
+@dp.business_message()
+async def handle_business_message(message: Message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    text = (message.text or "").strip()
+    conn_id = message.business_connection_id
+
+    if not conn_id:
+        return
+
+    await handle_custom_logic(chat_id, user_id, text, is_business=True, business_connection_id=conn_id)
+
+
+@dp.message(F.text)
+async def handle_regular_message(message: Message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    text = (message.text or "").strip()
+
+    await handle_custom_logic(chat_id, user_id, text, is_business=False)
 
 
 # ============================================================
