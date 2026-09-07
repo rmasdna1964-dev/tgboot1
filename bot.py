@@ -1,465 +1,582 @@
+import os
+import time
+import json
 import asyncio
 import logging
-import random
-import os
-import aiohttp
-from aiogram import Bot, Dispatcher, types, F
+from pathlib import Path
+from typing import Any, Dict
+
+import aiofiles
+from dotenv import load_dotenv
+
+from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import CommandStart
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# Настройки и токены
+# ==========================================
+# 1. КОНФИГУРАЦИЯ И ПУТИ
+# ==========================================
+load_dotenv()
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-
 if not BOT_TOKEN:
-    logging.warning("BOT_TOKEN не найден в переменных окружения. Укажите его перед запуском.")
+    raise ValueError("Ошибка: Переменная BOT_TOKEN не найдена в файле .env или окружении!")
 
-bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
-dp = Dispatcher(storage=MemoryStorage())
+BASE_DIR = Path(__file__).parent
+DATA_DIR = BASE_DIR / "data"
 
-# Глобальные переменные управления
-is_spamming = False
-is_trolling = False
-is_ghouling = False
+SETTINGS_FILE = DATA_DIR / "settings.json"
+CHATS_FILE = DATA_DIR / "chats.json"
+COOLDOWNS_FILE = DATA_DIR / "cooldowns.json"
 
-# Состояние AFK (автоответчика)
-afk_status = {"active": False, "reason": "Занят"}
+DEFAULT_SETTINGS = {
+    "auto_reply_enabled": False,
+    "auto_reply_text": "Сейчас меня нет у телефона. Отвечу позже.",
+    "auto_reply_interval": 900,
+    "afk_enabled": False,
+    "afk_text": ""
+}
 
-# Состояния FSM для ввода текста автоответчика
-class AFKState(StatesGroup):
-    waiting_for_text = State()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
+logger = logging.getLogger(__name__)
 
-# Локальное хранилище данных (вместо Supabase)
-notes = {}
-active_games = {}
-users_db = {}
+# ==========================================
+# 2. JSON-ХРАНИЛИЩЕ И СЕРВИСЫ
+# ==========================================
+class JSONStorageService:
+    def __init__(self, file_path: Path, default_data: Dict[str, Any] = None):
+        self.file_path = file_path
+        self.default_data = default_data if default_data is not None else {}
+        self._lock = asyncio.Lock()
+        self._ensure_file_exists()
 
-# Список фраз для авто-троллинга (.a_troll)
-TROLL_PHRASES = [
-    "Спорить с тобой — это как играть в шахматы с голубем.",
-    "Ты всегда такой умный или сегодня особенный день?",
-    "Ага, очень интересно, продолжай (нет).",
-    "Мнение принято, отправлено в корзину.",
-    "1000-7, гуль, получается?"
-]
+    def _ensure_file_exists(self) -> None:
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.file_path.exists():
+            with open(self.file_path, "w", encoding="utf-8") as f:
+                json.dump(self.default_data, f, ensure_ascii=False, indent=4)
 
-# Локальная регистрация пользователя
-async def get_or_create_user(user_id: int, username: str):
-    if user_id not in users_db:
-        users_db[user_id] = {"id": user_id, "username": username, "balance": 100}
-        return users_db[user_id], True
-    return users_db[user_id], False
+    async def load_data(self) -> Dict[str, Any]:
+        async with self._lock:
+            if not self.file_path.exists():
+                return self.default_data.copy()
+            try:
+                async with aiofiles.open(self.file_path, mode="r", encoding="utf-8") as f:
+                    content = await f.read()
+                    if not content.strip():
+                        return self.default_data.copy()
+                    return json.loads(content)
+            except (json.JSONDecodeError, OSError) as e:
+                logger.error(f"Ошибка чтения файла {self.file_path}: {e}. Загружаем дефолтные данные.")
+                return self.default_data.copy()
 
-# Главная панель управления (Клавиатура)
-def get_main_keyboard():
-    afk_btn_text = "🔴 Отключить автоответчик" if afk_status["active"] else "💤 Включить автоответчик"
+    async def save_data(self, data: Dict[str, Any]) -> None:
+        async with self._lock:
+            temp_file = self.file_path.with_suffix(".tmp")
+            try:
+                async with aiofiles.open(temp_file, mode="w", encoding="utf-8") as f:
+                    await f.write(json.dumps(data, ensure_ascii=False, indent=4))
+                temp_file.replace(self.file_path)
+            except Exception as e:
+                logger.error(f"Ошибка записи в {self.file_path}: {e}")
+                if temp_file.exists():
+                    temp_file.unlink()
+
+    async def get_user_data(self, user_id: int, default_user_data: Dict[str, Any]) -> Dict[str, Any]:
+        data = await self.load_data()
+        str_id = str(user_id)
+        if str_id not in data:
+            data[str_id] = default_user_data.copy()
+            await self.save_data(data)
+            return default_user_data.copy()
+        
+        updated = False
+        for k, v in default_user_data.items():
+            if k not in data[str_id]:
+                data[str_id][k] = v
+                updated = True
+        if updated:
+            await self.save_data(data)
+            
+        return data[str_id]
+
+    async def update_user_data(self, user_id: int, key: str, value: Any, default_user_data: Dict[str, Any]) -> Dict[str, Any]:
+        data = await self.load_data()
+        str_id = str(user_id)
+        if str_id not in data:
+            data[str_id] = default_user_data.copy()
+        
+        data[str_id][key] = value
+        await self.save_data(data)
+        return data[str_id]
+
+# Инициализация сервисов
+settings_storage = JSONStorageService(SETTINGS_FILE, default_data={})
+chats_storage = JSONStorageService(CHATS_FILE, default_data={})
+cooldowns_storage = JSONStorageService(COOLDOWNS_FILE, default_data={})
+
+class RateLimitService:
+    @staticmethod
+    async def can_send_reply(user_id: int, chat_id: int, interval_seconds: int) -> bool:
+        data = await cooldowns_storage.load_data()
+        last_reply = data.get(str(user_id), {}).get(str(chat_id), 0)
+        return (time.time() - last_reply) >= interval_seconds
+
+    @staticmethod
+    async def update_last_reply(user_id: int, chat_id: int) -> None:
+        data = await cooldowns_storage.load_data()
+        u_key, c_key = str(user_id), str(chat_id)
+        if u_key not in data:
+            data[u_key] = {}
+        data[u_key][c_key] = time.time()
+        await cooldowns_storage.save_data(data)
+
+# ==========================================
+# 3. КЛАВИАТУРЫ (INLINE)
+# ==========================================
+def get_main_keyboard(auto_reply_enabled: bool, afk_enabled: bool) -> InlineKeyboardMarkup:
+    ar_status = "🟢" if auto_reply_enabled else "🔴"
+    afk_status = "🟢" if afk_enabled else "🔴"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=afk_btn_text, callback_data="toggle_afk_panel")],
         [
-            InlineKeyboardButton(text="📖 Инструкция", callback_data="show_help"),
-            InlineKeyboardButton(text="🎮 Игра", callback_data="show_game_info")
+            InlineKeyboardButton(text=f"🤖 Автоответчик: {ar_status}", callback_data="nav_autoreply"),
+            InlineKeyboardButton(text=f"😴 AFK: {afk_status}", callback_data="nav_afk")
+        ],
+        [
+            InlineKeyboardButton(text="📝 Команды", callback_data="nav_commands"),
+            InlineKeyboardButton(text="📊 Статус", callback_data="nav_status")
+        ],
+        [
+            InlineKeyboardButton(text="⚙️ Настройки", callback_data="nav_settings"),
+            InlineKeyboardButton(text="❌ Отключить всё", callback_data="nav_disable_all")
         ]
     ])
 
-# Клавиатура подменю Инструкции (Бесплатные / Платные)
-def get_help_keyboard():
+def get_autoreply_keyboard(enabled: bool) -> InlineKeyboardMarkup:
+    toggle_btn = (
+        InlineKeyboardButton(text="🔴 Выключить", callback_data="ar_off")
+        if enabled else
+        InlineKeyboardButton(text="🟢 Включить", callback_data="ar_on")
+    )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [toggle_btn],
+        [
+            InlineKeyboardButton(text="📝 Изменить текст", callback_data="ar_change_text"),
+            InlineKeyboardButton(text="👁 Предпросмотр", callback_data="ar_preview")
+        ],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="nav_main")]
+    ])
+
+def get_afk_keyboard(enabled: bool) -> InlineKeyboardMarkup:
+    toggle_btn = (
+        InlineKeyboardButton(text="🔴 Выключить AFK", callback_data="afk_off")
+        if enabled else
+        InlineKeyboardButton(text="🟢 Включить AFK", callback_data="afk_on_prompt")
+    )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [toggle_btn],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="nav_main")]
+    ])
+
+def get_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
+    ])
+
+def get_settings_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🆓 Бесплатные команды", callback_data="show_free_commands"),
-            InlineKeyboardButton(text="⭐ Платные функции", callback_data="show_paid_commands")
+            InlineKeyboardButton(text="1 мин", callback_data="set_int_60"),
+            InlineKeyboardButton(text="5 мин", callback_data="set_int_300"),
+            InlineKeyboardButton(text="15 мин", callback_data="set_int_900")
+        ],
+        [
+            InlineKeyboardButton(text="30 мин", callback_data="set_int_1800"),
+            InlineKeyboardButton(text="1 час", callback_data="set_int_3600")
+        ],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="nav_main")]
+    ])
+
+def get_disable_all_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Да, отключить", callback_data="confirm_disable_all"),
+            InlineKeyboardButton(text="❌ Нет", callback_data="nav_main")
         ]
     ])
 
-# Клавиатура возврата в меню Инструкции
-def get_back_to_help_keyboard():
+def get_back_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Назад в меню инструкций", callback_data="show_help")]
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="nav_main")]
     ])
 
-# Клавиатура подтверждения отключения
-def get_confirm_turnoff_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Да, отключить", callback_data="confirm_afk_off"),
-            InlineKeyboardButton(text="❌ Нет, оставить", callback_data="cancel_afk_off")
-        ]
-    ])
+# ==========================================
+# 4. СОСТОЯНИЯ FSM
+# ==========================================
+class BotStates(StatesGroup):
+    waiting_for_autoreply_text = State()
+    waiting_for_afk_reason = State()
 
-# Игра КНБ
-def get_rps_keyboard(chat_id: int):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🗿 Камень", callback_data=f"rps_rock_{chat_id}"),
-            InlineKeyboardButton(text="✂️ Ножницы", callback_data=f"rps_scissors_{chat_id}"),
-            InlineKeyboardButton(text="📄 Бумага", callback_data=f"rps_paper_{chat_id}")
-        ]
-    ])
+# ==========================================
+# 5. ХЭНДЛЕРЫ И ЛОГИКА
+# ==========================================
+router = Router()
+SPAM_COOLDOWN = {}
 
-def get_post_game_keyboard(chat_id: int):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🎮 Сыграть ещё раз", callback_data=f"rps_restart_{chat_id}"),
-            InlineKeyboardButton(text="❌ Не хочу играть", callback_data=f"rps_cancel_{chat_id}")
-        ]
-    ])
-
-# --- КОМАНДА /start И ПАНЕЛЬ ---
-
-@dp.message(CommandStart())
+@router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
-    username = message.from_user.username or "Аноним"
-    await get_or_create_user(user_id, username)
+    settings = await settings_storage.get_user_data(user_id, DEFAULT_SETTINGS)
     
-    status_text = f"Статус автоответчика: **{'ВКЛЮЧЕН 🟢' if afk_status['active'] else 'ВЫКЛЮЧЕН 🔴'}**"
-    if afk_status["active"]:
-        status_text += f"\nТекущий текст: _{afk_status['reason']}_"
+    text = (
+        "🤖 **Автоматизация Telegram**\n\n"
+        "Здесь вы можете управлять автоответчиком,\n"
+        "AFK и доступными командами.\n\n"
+        f"🤖 Автоответчик: {'🟢' if settings['auto_reply_enabled'] else '🔴'}\n"
+        f"😴 AFK: {'🟢' if settings['afk_enabled'] else '🔴'}"
+    )
+    await message.answer(text, reply_markup=get_main_keyboard(settings['auto_reply_enabled'], settings['afk_enabled']), parse_mode="Markdown")
 
-    text = f"Привет, {username}!\nПанель управления Telegram Business.\n\n{status_text}"
-    await message.answer(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
+# --- ПАНЕЛЬ И НАВИГАЦИЯ ---
+@router.callback_query(F.data == "nav_main")
+async def nav_main(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    user_id = callback.from_user.id
+    settings = await settings_storage.get_user_data(user_id, DEFAULT_SETTINGS)
+    
+    text = (
+        "🤖 **Автоматизация Telegram**\n\n"
+        "Здесь вы можете управлять автоответчиком,\n"
+        "AFK и доступными командами.\n\n"
+        f"🤖 Автоответчик: {'🟢' if settings['auto_reply_enabled'] else '🔴'}\n"
+        f"😴 AFK: {'🟢' if settings['afk_enabled'] else '🔴'}"
+    )
+    await callback.message.edit_text(text, reply_markup=get_main_keyboard(settings['auto_reply_enabled'], settings['afk_enabled']), parse_mode="Markdown")
+    await callback.answer()
 
-# Нажатие на кнопку Автоответчика в панели
-@dp.callback_query(F.data == "toggle_afk_panel")
-async def process_afk_toggle_click(callback_query: CallbackQuery, state: FSMContext):
-    if not afk_status["active"]:
-        await state.set_state(AFKState.waiting_for_text)
-        await callback_query.message.answer("⌨️ **Напишите текст для автоответчика:**\n_(Этот текст будет отправляться всем в ЛС)_", parse_mode="Markdown")
-        await callback_query.answer()
-    else:
-        await callback_query.message.answer(
-            "⚠️ **Точно отключить автоответчик?**",
-            reply_markup=get_confirm_turnoff_keyboard(),
-            parse_mode="Markdown"
-        )
-        await callback_query.answer()
+@router.callback_query(F.data == "nav_autoreply")
+async def nav_autoreply(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    settings = await settings_storage.get_user_data(user_id, DEFAULT_SETTINGS)
+    interval_min = settings['auto_reply_interval'] // 60
+    
+    text = (
+        "🤖 **Автоответчик**\n\n"
+        f"Статус: {'🟢 Включён' if settings['auto_reply_enabled'] else '🔴 Выключен'}\n"
+        f"Текст: {settings['auto_reply_text'] if settings['auto_reply_text'] else 'не установлен'}\n"
+        f"Интервал: {interval_min} минут"
+    )
+    await callback.message.edit_text(text, reply_markup=get_autoreply_keyboard(settings['auto_reply_enabled']), parse_mode="Markdown")
+    await callback.answer()
 
-# Прием текста автоответчика от пользователя
-@dp.message(AFKState.waiting_for_text)
-async def process_afk_text_input(message: Message, state: FSMContext):
-    text = message.text.strip()
-    afk_status["active"] = True
-    afk_status["reason"] = text
+@router.callback_query(F.data == "nav_afk")
+async def nav_afk(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    settings = await settings_storage.get_user_data(user_id, DEFAULT_SETTINGS)
+    
+    text = (
+        "😴 **Управление AFK**\n\n"
+        f"Статус: {'🟢 Включён' if settings['afk_enabled'] else '🔴 Выключен'}\n"
+        f"Причина: {settings['afk_text'] if settings['afk_text'] else 'не указана'}"
+    )
+    await callback.message.edit_text(text, reply_markup=get_afk_keyboard(settings['afk_enabled']), parse_mode="Markdown")
+    await callback.answer()
+
+@router.callback_query(F.data == "nav_commands")
+async def nav_commands(callback: CallbackQuery):
+    text = (
+        "📝 **Список доступных команд:**\n\n"
+        "• `.afk [причина]` — Включить режим AFK\n"
+        "• `.afk off` — Выключить режим AFK\n"
+        "• `.status` — Посмотреть текущий статус систем\n"
+        "• `.auto` — Переключить автоответчик\n"
+        "• `.spam [текст]` — Безопасный авто-ответ\n"
+        "• `.help` — Справка по командам"
+    )
+    await callback.message.edit_text(text, reply_markup=get_back_keyboard(), parse_mode="Markdown")
+    await callback.answer()
+
+@router.callback_query(F.data == "nav_status")
+async def nav_status(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    settings = await settings_storage.get_user_data(user_id, DEFAULT_SETTINGS)
+    chats_data = await chats_storage.load_data()
+    user_chats = len(chats_data.get(str(user_id), []))
+    
+    interval_min = settings['auto_reply_interval'] // 60
+    has_text = "установлен" if settings['auto_reply_text'] else "не установлен"
+    
+    text = (
+        "📊 **Статус**\n\n"
+        f"🤖 Автоответчик: {'🟢 Включён' if settings['auto_reply_enabled'] else '🔴 Выключен'}\n"
+        f"😴 AFK: {'🟢 Включён' if settings['afk_enabled'] else '🔴 Выключен'}\n\n"
+        f"📝 Текст: {has_text}\n"
+        f"⏱ Интервал: {interval_min} минут\n\n"
+        f"💬 Разрешённых чатов: {user_chats}"
+    )
+    await callback.message.edit_text(text, reply_markup=get_back_keyboard(), parse_mode="Markdown")
+    await callback.answer()
+
+@router.callback_query(F.data == "nav_settings")
+async def nav_settings(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    settings = await settings_storage.get_user_data(user_id, DEFAULT_SETTINGS)
+    interval_min = settings['auto_reply_interval'] // 60
+    
+    text = (
+        "⚙️ **Настройки**\n\n"
+        f"Текущий интервал автоответчика: **{interval_min} минут**\n"
+        "Выберите новый интервал отправки повторных ответов:"
+    )
+    await callback.message.edit_text(text, reply_markup=get_settings_keyboard(), parse_mode="Markdown")
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("set_int_"))
+async def process_set_interval(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    seconds = int(callback.data.split("_")[2])
+    await settings_storage.update_user_data(user_id, "auto_reply_interval", seconds, DEFAULT_SETTINGS)
+    
+    await callback.answer(f"✅ Интервал изменён на {seconds // 60} минут!")
+    await nav_settings(callback)
+
+@router.callback_query(F.data == "nav_disable_all")
+async def nav_disable_all(callback: CallbackQuery):
+    text = "⚠️ **Отключить все автоматизации?**\n\nАвтоответчик и AFK будут выключены."
+    await callback.message.edit_text(text, reply_markup=get_disable_all_keyboard(), parse_mode="Markdown")
+    await callback.answer()
+
+@router.callback_query(F.data == "confirm_disable_all")
+async def confirm_disable_all(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    await settings_storage.update_user_data(user_id, "auto_reply_enabled", False, DEFAULT_SETTINGS)
+    await settings_storage.update_user_data(user_id, "afk_enabled", False, DEFAULT_SETTINGS)
+    
+    await callback.answer("✅ Все автоматизации отключены!")
+    await nav_main(callback, state)
+
+# --- АВТООТВЕТЧИК УПРАВЛЕНИЕ ---
+@router.callback_query(F.data == "ar_on")
+async def ar_on(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    settings = await settings_storage.get_user_data(user_id, DEFAULT_SETTINGS)
+    
+    if not settings["auto_reply_text"]:
+        await state.set_state(BotStates.waiting_for_autoreply_text)
+        await callback.message.edit_text("📝 **Отправьте текст автоответчика.**", reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+        await callback.answer()
+        return
+
+    await settings_storage.update_user_data(user_id, "auto_reply_enabled", True, DEFAULT_SETTINGS)
+    await callback.answer("🟢 Автоответчик включён!")
+    await nav_autoreply(callback)
+
+@router.callback_query(F.data == "ar_off")
+async def ar_off(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    await settings_storage.update_user_data(user_id, "auto_reply_enabled", False, DEFAULT_SETTINGS)
+    await callback.answer("🔴 Автоответчик выключен!")
+    await nav_autoreply(callback)
+
+@router.callback_query(F.data == "ar_change_text")
+async def ar_change_text(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(BotStates.waiting_for_autoreply_text)
+    await callback.message.edit_text("📝 **Отправьте новый текст автоответчика.**", reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+    await callback.answer()
+
+@router.message(BotStates.waiting_for_autoreply_text)
+async def process_new_ar_text(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    new_text = message.text.strip()
+    
+    await settings_storage.update_user_data(user_id, "auto_reply_text", new_text, DEFAULT_SETTINGS)
+    await settings_storage.update_user_data(user_id, "auto_reply_enabled", True, DEFAULT_SETTINGS)
     await state.clear()
     
-    await message.answer(
-        f"✅ **Автоответчик успешно включен!**\n\nТекст ответа:\n_{text}_",
-        reply_markup=get_main_keyboard(),
-        parse_mode="Markdown"
-    )
-
-# Подтверждение отключения (Кнопка Да)
-@dp.callback_query(F.data == "confirm_afk_off")
-async def process_confirm_afk_off(callback_query: CallbackQuery):
-    afk_status["active"] = False
-    await callback_query.message.edit_text("☀️ **Автоответчик выключен.**", parse_mode="Markdown")
-    await callback_query.answer("Автоответчик выключен!")
-
-# Отмена отключения (Кнопка Нет)
-@dp.callback_query(F.data == "cancel_afk_off")
-async def process_cancel_afk_off(callback_query: CallbackQuery):
-    await callback_query.message.edit_text("👍 Автоответчик остался **включенным**.", parse_mode="Markdown")
-    await callback_query.answer()
-
-# --- CALLBACKS ИНСТРУКЦИИ И ИГРЫ ---
-
-@dp.callback_query(F.data == "show_help")
-async def process_help_callback(callback_query: CallbackQuery):
-    help_text = "📖 **Выберите категорию команд для просмотра:**"
-    await callback_query.message.edit_text(help_text, reply_markup=get_help_keyboard(), parse_mode="Markdown")
-    await callback_query.answer()
-
-@dp.callback_query(F.data == "show_free_commands")
-async def process_free_commands_callback(callback_query: CallbackQuery):
-    free_text = (
-        "🆓 **Бесплатные команды:**\n\n"
-        "🐱 `.cat` — Случайное фото котика.\n"
-        "⚡ `.ghoul` — Цикл 1000-7 (Dead Inside).\n"
-        "🛑 `.ghoulstop` — Остановить цикл 1000-7.\n"
-        "👤 `.info` — Информация о пользователе.\n"
-        "🎭 `.a_troll` — Включить/выключить авто-троллинг.\n"
-        "💤 `.afk [причина]` / `.unafk` — Быстрый автоответчик.\n"
-        "📌 `.note [имя] [текст]` / `.get [имя]` — Заметки.\n"
-        "✍️ `.fix [текст]` — Исправить и оформить текст.\n"
-        "🎮 `.starts` — Игра «Камень, ножницы, бумага»."
-    )
-    await callback_query.message.edit_text(free_text, reply_markup=get_back_to_help_keyboard(), parse_mode="Markdown")
-    await callback_query.answer()
-
-@dp.callback_query(F.data == "show_paid_commands")
-async def process_paid_commands_callback(callback_query: CallbackQuery):
-    paid_text = (
-        "⭐ **Платные / Премиум функции:**\n\n"
-        "💸 `.send [сумма]` — Сгенерировать фейк чек Crypto Bot.\n"
-        "🚀 `.spam [текст]` — Обычный спам сообщениями.\n"
-        "⚡ `.killerspam [текст]` — Скоростной спам (0.1 сек).\n"
-        "🛑 `.stop` — Остановить активный спам."
-    )
-    await callback_query.message.edit_text(paid_text, reply_markup=get_back_to_help_keyboard(), parse_mode="Markdown")
-    await callback_query.answer()
-
-@dp.callback_query(F.data == "show_game_info")
-async def process_game_info_callback(callback_query: CallbackQuery):
-    await callback_query.message.answer("🎮 Запустите дуэль командой: `.starts`", parse_mode="Markdown")
-    await callback_query.answer()
-
-# Игра КНБ Handlers
-@dp.callback_query(lambda c: c.data and (c.data.startswith("rps_restart_") or c.data.startswith("rps_cancel_")))
-async def process_post_game_actions(callback_query: CallbackQuery):
-    parts = callback_query.data.split("_")
-    action, chat_id = parts[1], int(parts[2])
-
-    if action == "restart":
-        active_games[chat_id] = {"choices": {}}
-        await callback_query.message.edit_text("🎮 **Дуэль: Камень, ножницы, бумага!**", reply_markup=get_rps_keyboard(chat_id))
-    elif action == "cancel":
-        if chat_id in active_games: del active_games[chat_id]
-        try: await callback_query.message.delete()
-        except: await callback_query.message.edit_text("❌ Игра завершена.")
-
-@dp.callback_query(lambda c: c.data and c.data.startswith("rps_"))
-async def process_rps_choice(callback_query: CallbackQuery):
-    parts = callback_query.data.split("_")
-    choice, chat_id = parts[1], int(parts[2])
-    user_id, user_name = callback_query.from_user.id, callback_query.from_user.first_name
-
-    if chat_id not in active_games:
-        await callback_query.answer("Игра не найдена. Напишите .starts", show_alert=True)
-        return
-
-    game = active_games[chat_id]
-    game["choices"][user_id] = {"choice": choice, "name": user_name}
-    await callback_query.answer(f"Вы выбрали {choice.upper()}!")
-
-    if len(game["choices"]) >= 2:
-        await callback_query.message.edit_text("⏳ Подсчитываем результаты...")
-        await asyncio.sleep(2)
-        players = list(game["choices"].values())
-        p1, p2 = players[0], players[1]
-        c1, c2 = p1["choice"], p2["choice"]
-
-        if c1 == c2: result = "🤝 **Ничья!**"
-        elif (c1=="rock" and c2=="scissors") or (c1=="scissors" and c2=="paper") or (c1=="paper" and c2=="rock"):
-            result = f"🏆 Победил **{p1['name']}**!"
-        else:
-            result = f"🏆 Победил **{p2['name']}**!"
-
-        res_text = f"🎮 **Результаты:**\n👤 **{p1['name']}**: {c1}\n👤 **{p2['name']}**: {c2}\n\n{result}"
-        await callback_query.message.edit_text(res_text, reply_markup=get_post_game_keyboard(chat_id), parse_mode="Markdown")
-
-# --- ОСНОВНОЙ ОБРАБОТЧИК TELEGRAM BUSINESS ---
-
-@dp.business_message()
-async def handle_business_message(message: Message):
-    global is_spamming, is_trolling, is_ghouling, active_games, afk_status, notes
+    settings = await settings_storage.get_user_data(user_id, DEFAULT_SETTINGS)
+    interval_min = settings['auto_reply_interval'] // 60
     
+    await message.answer("✅ **Текст успешно сохранён!**", parse_mode="Markdown")
+    text = f"🤖 **Автоответчик**\n\nСтатус: 🟢 Включён\nТекст: {settings['auto_reply_text']}\nИнтервал: {interval_min} минут"
+    await message.answer(text, reply_markup=get_autoreply_keyboard(True), parse_mode="Markdown")
+
+@router.callback_query(F.data == "ar_preview")
+async def ar_preview(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    settings = await settings_storage.get_user_data(user_id, DEFAULT_SETTINGS)
+    reply_text = settings['auto_reply_text'] if settings['auto_reply_text'] else "_(Текст не установлен)_"
+    await callback.message.answer(f"👁 **Предпросмотр автоответа:**\n\n{reply_text}", parse_mode="Markdown")
+    await callback.answer()
+
+# --- AFK УПРАВЛЕНИЕ ---
+@router.callback_query(F.data == "afk_on_prompt")
+async def afk_on_prompt(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(BotStates.waiting_for_afk_reason)
+    await callback.message.edit_text("😴 **Отправьте причину ухода в AFK:**", reply_markup=get_cancel_keyboard(), parse_mode="Markdown")
+    await callback.answer()
+
+@router.message(BotStates.waiting_for_afk_reason)
+async def process_afk_reason(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    reason = message.text.strip()
+    
+    await settings_storage.update_user_data(user_id, "afk_enabled", True, DEFAULT_SETTINGS)
+    await settings_storage.update_user_data(user_id, "afk_text", reason, DEFAULT_SETTINGS)
+    await state.clear()
+    
+    await message.answer(f"😴 **AFK включён**\n\nПричина:\n{reason}", parse_mode="Markdown")
+    text = f"😴 **Управление AFK**\n\nСтатус: 🟢 Включён\nПричина: {reason}"
+    await message.answer(text, reply_markup=get_afk_keyboard(True), parse_mode="Markdown")
+
+@router.callback_query(F.data == "afk_off")
+async def afk_off(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    await settings_storage.update_user_data(user_id, "afk_enabled", False, DEFAULT_SETTINGS)
+    await settings_storage.update_user_data(user_id, "afk_text", "", DEFAULT_SETTINGS)
+    await callback.answer("🔴 AFK выключен!")
+    await nav_afk(callback)
+
+@router.callback_query(F.data == "cancel_action")
+async def cancel_action(callback: CallbackQuery, state: FSMContext):
+    await nav_main(callback, state)
+    await callback.answer("Действие отменено.")
+
+# --- КОМАНДЫ (.) И ОБРАБОТЧИК СООБЩЕНИЙ ---
+@router.message(F.text.startswith("."))
+async def handle_dot_commands(message: Message):
+    user_id = message.from_user.id
+    text = message.text.strip()
+
+    if text.startswith(".afk"):
+        args = text[4:].strip()
+        if args.lower() == "off":
+            await settings_storage.update_user_data(user_id, "afk_enabled", False, DEFAULT_SETTINGS)
+            await settings_storage.update_user_data(user_id, "afk_text", "", DEFAULT_SETTINGS)
+            await message.reply("🔴 AFK выключен!")
+        else:
+            reason = args if args else "Занят"
+            await settings_storage.update_user_data(user_id, "afk_enabled", True, DEFAULT_SETTINGS)
+            await settings_storage.update_user_data(user_id, "afk_text", reason, DEFAULT_SETTINGS)
+            await message.reply(f"😴 **AFK включён**\n\nПричина:\n{reason}", parse_mode="Markdown")
+
+    elif text == ".status":
+        settings = await settings_storage.get_user_data(user_id, DEFAULT_SETTINGS)
+        chats_data = await chats_storage.load_data()
+        user_chats = len(chats_data.get(str(user_id), []))
+        interval_min = settings['auto_reply_interval'] // 60
+
+        reply = (
+            "📊 **Текущий статус:**\n\n"
+            f"🤖 Автоответчик: {'🟢 Включён' if settings['auto_reply_enabled'] else '🔴 Выключен'}\n"
+            f"😴 AFK: {'🟢 Включён' if settings['afk_enabled'] else '🔴 Выключен'}\n"
+            f"⏱ Интервал: {interval_min} мин\n"
+            f"💬 Чат-лист: {user_chats} чатов"
+        )
+        await message.reply(reply, parse_mode="Markdown")
+
+    elif text == ".auto":
+        settings = await settings_storage.get_user_data(user_id, DEFAULT_SETTINGS)
+        new_state = not settings["auto_reply_enabled"]
+        await settings_storage.update_user_data(user_id, "auto_reply_enabled", new_state, DEFAULT_SETTINGS)
+        status_str = "🟢 Включён" if new_state else "🔴 Выключен"
+        await message.reply(f"🤖 Автоответчик теперь: **{status_str}**", parse_mode="Markdown")
+
+    elif text.startswith(".spam"):
+        spam_text = text[5:].strip()
+        if not spam_text:
+            await message.reply("⚠️ Укажите текст: `.spam Ваш текст`", parse_mode="Markdown")
+            return
+
+        now = time.time()
+        if now - SPAM_COOLDOWN.get(user_id, 0) < 5.0:
+            await message.reply("🛡 **Защита от спама:** Не чаще раза в 5 секунд.")
+            return
+
+        chats_data = await chats_storage.load_data()
+        allowed_chats = chats_data.get(str(user_id), [])
+        if message.chat.id not in allowed_chats:
+            await message.reply("🛡 **Безопасность:** Чат не входит в список разрешённых.")
+            return
+
+        SPAM_COOLDOWN[user_id] = now
+        await message.reply(f"💬 [Безопасный авто-ответ]: {spam_text}")
+
+    elif text == ".help":
+        help_msg = (
+            "📖 **Справка по точка-командам:**\n\n"
+            "• `.afk [причина]` — Включить AFK\n"
+            "• `.afk off` — Выключить AFK\n"
+            "• `.status` — Статус систем\n"
+            "• `.auto` — Переключить автоответчик\n"
+            "• `.spam [текст]` — Безопасный авто-ответ\n"
+            "• `.help` — Вывести эту справку"
+        )
+        await message.reply(help_msg, parse_mode="Markdown")
+
+@router.business_message()
+@router.message(F.chat.type == "private")
+async def handle_incoming_messages(message: Message):
+    if message.text and message.text.startswith("."):
+        return
+
+    user_id = message.from_user.id
     chat_id = message.chat.id
-    text = (message.text or "").strip()
+    conn_id = message.business_connection_id
 
-    # 1. ОБРАБОТКА ВАШИХ КОМАНД (Начинаются с точки ".")
-    if text.startswith("."):
-        if text.startswith(".afk"):
-            reason = text[4:].strip() or "Сплю"
-            afk_status["active"] = True
-            afk_status["reason"] = reason
-            await bot.send_message(
-                chat_id=chat_id,
-                text=f"💤 **Режим AFK включен.**\nПричина: {reason}",
-                business_connection_id=message.business_connection_id,
-                parse_mode="Markdown"
-            )
+    # Авто-регистрация чата
+    chats_data = await chats_storage.load_data()
+    str_uid = str(user_id)
+    if str_uid not in chats_data:
+        chats_data[str_uid] = []
+    if chat_id not in chats_data[str_uid]:
+        chats_data[str_uid].append(chat_id)
+        await chats_storage.save_data(chats_data)
+
+    settings = await settings_storage.get_user_data(user_id, DEFAULT_SETTINGS)
+
+    # AFK
+    if settings["afk_enabled"] and settings["afk_text"]:
+        if await RateLimitService.can_send_reply(user_id, chat_id, interval_seconds=60):
+            await RateLimitService.update_last_reply(user_id, chat_id)
+            afk_msg = f"😴 Пользователь сейчас AFK.\n\nПричина: {settings['afk_text']}"
+            await message.bot.send_message(chat_id=chat_id, text=afk_msg, business_connection_id=conn_id)
             return
 
-        elif text.startswith(".unafk"):
-            afk_status["active"] = False
-            await bot.send_message(
-                chat_id=chat_id,
-                text="☀️ **Режим AFK выключен.**",
-                business_connection_id=message.business_connection_id,
-                parse_mode="Markdown"
-            )
-            return
+    # Автоответчик
+    if settings["auto_reply_enabled"] and settings["auto_reply_text"]:
+        interval = settings["auto_reply_interval"]
+        if await RateLimitService.can_send_reply(user_id, chat_id, interval_seconds=interval):
+            await RateLimitService.update_last_reply(user_id, chat_id)
+            await message.bot.send_message(chat_id=chat_id, text=settings["auto_reply_text"], business_connection_id=conn_id)
 
-        elif text == ".ghoulstop":
-            is_ghouling = False
-            await bot.send_message(
-                chat_id=chat_id,
-                text="🛑 **Цикл 1000-7 остановлен.**",
-                business_connection_id=message.business_connection_id,
-                parse_mode="Markdown"
-            )
-            return
-
-        elif text == ".cat":
-            async with aiohttp.ClientSession() as session:
-                async with session.get("https://api.thecatapi.com/v1/images/search") as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        await bot.send_photo(
-                            chat_id=chat_id,
-                            photo=data[0]["url"],
-                            caption="🐱 Вот твой случайный котик!",
-                            business_connection_id=message.business_connection_id
-                        )
-            return
-
-        elif text == ".ghoul":
-            if is_ghouling: return
-            is_ghouling = True
-            val = 1000
-            while val > 0 and is_ghouling:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=f"{val} - 7 = {val - 7}",
-                    business_connection_id=message.business_connection_id
-                )
-                val -= 7
-                await asyncio.sleep(0.3)
-                if val < 7: break
-            if is_ghouling:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text="я гуль...",
-                    business_connection_id=message.business_connection_id
-                )
-            is_ghouling = False
-            return
-
-        elif text == ".info":
-            user = message.from_user
-            info_msg = (
-                f"👤 **Информация о пользователе:**\n\n"
-                f"• **Имя:** {user.first_name}\n"
-                f"• **ID:** `{user.id}`\n"
-                f"• **Username:** @{user.username if user.username else 'отсутствует'}\n"
-                f"• **Премиум:** {'Да' if user.is_premium else 'Нет'}"
-            )
-            await bot.send_message(
-                chat_id=chat_id,
-                text=info_msg,
-                business_connection_id=message.business_connection_id,
-                parse_mode="Markdown"
-            )
-            return
-
-        elif text == ".a_troll":
-            is_trolling = not is_trolling
-            status = "включен 🎭" if is_trolling else "выключен 🛑"
-            await bot.send_message(
-                chat_id=chat_id,
-                text=f"Режим авто-троллинга **{status}**",
-                business_connection_id=message.business_connection_id,
-                parse_mode="Markdown"
-            )
-            return
-
-        elif text.startswith(".send"):
-            amount = text[5:].strip() or "10"
-            check_markup = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text=f"Получить {amount} USDT 💬", url="https://t.me/send")]
-            ])
-            await bot.send_message(
-                chat_id=chat_id,
-                text=f"✅ **Вы получили чек на {amount} USDT ($ {amount})**\n\nНажмите кнопку ниже, чтобы забрать средства.",
-                reply_markup=check_markup,
-                business_connection_id=message.business_connection_id,
-                parse_mode="Markdown"
-            )
-            return
-
-        elif text.startswith(".note"):
-            args = text[5:].strip().split(maxsplit=1)
-            if len(args) == 2:
-                notes[args[0].lower()] = args[1]
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=f"📌 Заметка **'{args[0]}'** сохранена!",
-                    business_connection_id=message.business_connection_id,
-                    parse_mode="Markdown"
-                )
-            return
-
-        elif text.startswith(".get"):
-            note_name = text[4:].strip().lower()
-            res = notes.get(note_name, f"❌ Заметка **'{note_name}'** не найдена.")
-            await bot.send_message(
-                chat_id=chat_id,
-                text=res,
-                business_connection_id=message.business_connection_id,
-                parse_mode="Markdown"
-            )
-            return
-
-        elif text.startswith(".fix"):
-            raw = text[4:].strip()
-            if raw:
-                fixed = raw.capitalize() + ("." if not raw.endswith(('.', '!', '?')) else "")
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=fixed,
-                    business_connection_id=message.business_connection_id
-                )
-            return
-
-        elif text == ".starts":
-            active_games[chat_id] = {"choices": {}}
-            await bot.send_message(
-                chat_id=chat_id,
-                text="🎮 **Дуэль: Камень, ножницы, бумага!**",
-                reply_markup=get_rps_keyboard(chat_id),
-                business_connection_id=message.business_connection_id,
-                parse_mode="Markdown"
-            )
-            return
-
-        elif text.startswith(".spam"):
-            msg = text[5:].strip()
-            if msg:
-                is_spamming = True
-                while is_spamming:
-                    await bot.send_message(chat_id=chat_id, text=msg, business_connection_id=message.business_connection_id)
-                    await asyncio.sleep(1.5)
-            return
-
-        elif text.startswith(".killerspam"):
-            msg = text[11:].strip()
-            if msg:
-                is_spamming = True
-                while is_spamming:
-                    await bot.send_message(chat_id=chat_id, text=msg, business_connection_id=message.business_connection_id)
-                    await asyncio.sleep(0.1)
-            return
-
-        elif text == ".stop":
-            is_spamming = False
-            await bot.send_message(chat_id=chat_id, text="🛑 Спам остановлен.", business_connection_id=message.business_connection_id)
-            return
-
-    # 2. ОБРАБОТКА ВХОДЯЩИХ СООБЩЕНИЙ ОТ СОБЕСЕДНИКОВ (Только Личные Чаты)
-    if afk_status["active"] and message.chat.type == "private":
-        await bot.send_message(
-            chat_id=chat_id,
-            text=afk_status["reason"],
-            business_connection_id=message.business_connection_id
-        )
-        return
-
-    if is_trolling:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=random.choice(TROLL_PHRASES),
-            business_connection_id=message.business_connection_id
-        )
-        return
-
+# ==========================================
+# 6. ЗАПУСК БОТА
+# ==========================================
 async def main():
-    logging.basicConfig(level=logging.INFO)
-    if not bot:
-        logging.error("Невозможно запустить бота: BOT_TOKEN не задан.")
-        return
-    await dp.start_polling(bot)
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+
+    await bot.delete_webhook(drop_pending_updates=True)
+    logger.info("Бот успешно запущен!")
+    
+    await dp.start_polling(
+        bot,
+        allowed_updates=[
+            "message",
+            "callback_query",
+            "business_message",
+            "edited_business_message",
+            "business_connection"
+        ]
+    )
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот остановлен.")
