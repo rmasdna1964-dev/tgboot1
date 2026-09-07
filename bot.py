@@ -8,7 +8,7 @@ from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, C
 from aiogram.fsm.storage.memory import MemoryStorage
 
 # Настройки и токен
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8872260684:AAED-oo-qBqge-nTot8Kva1H4wxjRZvSHSM").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8955553619:AAGPRoVXir741kBwfYcGg6GlJhI4WzezK2Y").strip()
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
