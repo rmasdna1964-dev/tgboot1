@@ -14,9 +14,13 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# Токен бота
+# ============================================================
+# НАСТРОЙКИ И АВТОМАТИЧЕСКАЯ ПОДСТАНОВКА ТОКЕНА
+# ============================================================
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8955553619:AAGPRoVXir741kBwfYcGg6GlJhI4WzezK2Y").strip()
 
+# Инициализация бота с верным именованным аргументом 'token'
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -146,7 +150,6 @@ async def confirm_start(callback: CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
-    # Запуск цикла спама
     for _ in range(50):
         if not active_spams.get(chat_id, False):
             break
