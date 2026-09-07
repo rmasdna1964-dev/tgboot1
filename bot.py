@@ -113,7 +113,6 @@ class JSONStorageService:
         await self.save_data(data)
         return data[str_id]
 
-# Инициализация сервисов
 settings_storage = JSONStorageService(SETTINGS_FILE, default_data={})
 chats_storage = JSONStorageService(CHATS_FILE, default_data={})
 cooldowns_storage = JSONStorageService(COOLDOWNS_FILE, default_data={})
@@ -135,7 +134,7 @@ class RateLimitService:
         await cooldowns_storage.save_data(data)
 
 # ==========================================
-# 3. КЛАВИАТУРЫ (INLINE)
+# 3. КЛАВИАТУРЫ
 # ==========================================
 def get_main_keyboard(auto_reply_enabled: bool, afk_enabled: bool) -> InlineKeyboardMarkup:
     ar_status = "🟢" if auto_reply_enabled else "🔴"
@@ -445,9 +444,12 @@ async def cancel_action(callback: CallbackQuery, state: FSMContext):
     await nav_main(callback, state)
     await callback.answer("Действие отменено.")
 
-# --- КОМАНДЫ (.) И ОБРАБОТЧИК СООБЩЕНИЙ ---
-@router.message(F.text.startswith("."))
-async def handle_dot_commands(message: Message):
+# --- ВЫНЕСЕННАЯ ЛОГИКА КОМАНД И АВТООТВЕТА ---
+async def process_dot_command(message: Message) -> bool:
+    """Обрабатывает точка-команды. Возвращает True, если была выполнена команда."""
+    if not message.text or not message.text.startswith("."):
+        return False
+
     user_id = message.from_user.id
     text = message.text.strip()
 
@@ -462,6 +464,7 @@ async def handle_dot_commands(message: Message):
             await settings_storage.update_user_data(user_id, "afk_enabled", True, DEFAULT_SETTINGS)
             await settings_storage.update_user_data(user_id, "afk_text", reason, DEFAULT_SETTINGS)
             await message.reply(f"😴 **AFK включён**\n\nПричина:\n{reason}", parse_mode="Markdown")
+        return True
 
     elif text == ".status":
         settings = await settings_storage.get_user_data(user_id, DEFAULT_SETTINGS)
@@ -477,6 +480,7 @@ async def handle_dot_commands(message: Message):
             f"💬 Чат-лист: {user_chats} чатов"
         )
         await message.reply(reply, parse_mode="Markdown")
+        return True
 
     elif text == ".auto":
         settings = await settings_storage.get_user_data(user_id, DEFAULT_SETTINGS)
@@ -484,26 +488,22 @@ async def handle_dot_commands(message: Message):
         await settings_storage.update_user_data(user_id, "auto_reply_enabled", new_state, DEFAULT_SETTINGS)
         status_str = "🟢 Включён" if new_state else "🔴 Выключен"
         await message.reply(f"🤖 Автоответчик теперь: **{status_str}**", parse_mode="Markdown")
+        return True
 
     elif text.startswith(".spam"):
         spam_text = text[5:].strip()
         if not spam_text:
             await message.reply("⚠️ Укажите текст: `.spam Ваш текст`", parse_mode="Markdown")
-            return
+            return True
 
         now = time.time()
         if now - SPAM_COOLDOWN.get(user_id, 0) < 5.0:
             await message.reply("🛡 **Защита от спама:** Не чаще раза в 5 секунд.")
-            return
-
-        chats_data = await chats_storage.load_data()
-        allowed_chats = chats_data.get(str(user_id), [])
-        if message.chat.id not in allowed_chats:
-            await message.reply("🛡 **Безопасность:** Чат не входит в список разрешённых.")
-            return
+            return True
 
         SPAM_COOLDOWN[user_id] = now
         await message.reply(f"💬 [Безопасный авто-ответ]: {spam_text}")
+        return True
 
     elif text == ".help":
         help_msg = (
@@ -516,18 +516,24 @@ async def handle_dot_commands(message: Message):
             "• `.help` — Вывести эту справку"
         )
         await message.reply(help_msg, parse_mode="Markdown")
+        return True
 
-@router.business_message()
-@router.message(F.chat.type == "private")
-async def handle_incoming_messages(message: Message):
-    if message.text and message.text.startswith("."):
+    return False
+
+async def process_auto_reply(message: Message, is_business: bool = False):
+    """Единая функция автоответа для ЛС и Telegram Business."""
+    if message.from_user and message.from_user.is_bot:
+        return
+
+    # 1. Проверяем, была ли это точка-команда
+    if await process_dot_command(message):
         return
 
     user_id = message.from_user.id
     chat_id = message.chat.id
-    conn_id = message.business_connection_id
+    conn_id = getattr(message, "business_connection_id", None)
 
-    # Авто-регистрация чата
+    # Регистрируем чат
     chats_data = await chats_storage.load_data()
     str_uid = str(user_id)
     if str_uid not in chats_data:
@@ -538,20 +544,38 @@ async def handle_incoming_messages(message: Message):
 
     settings = await settings_storage.get_user_data(user_id, DEFAULT_SETTINGS)
 
-    # AFK
+    # 2. Логика AFK
     if settings["afk_enabled"] and settings["afk_text"]:
         if await RateLimitService.can_send_reply(user_id, chat_id, interval_seconds=60):
             await RateLimitService.update_last_reply(user_id, chat_id)
             afk_msg = f"😴 Пользователь сейчас AFK.\n\nПричина: {settings['afk_text']}"
-            await message.bot.send_message(chat_id=chat_id, text=afk_msg, business_connection_id=conn_id)
+            
+            if is_business and conn_id:
+                await message.bot.send_message(chat_id=chat_id, text=afk_msg, business_connection_id=conn_id)
+            else:
+                await message.answer(afk_msg)
             return
 
-    # Автоответчик
+    # 3. Логика Автоответчика
     if settings["auto_reply_enabled"] and settings["auto_reply_text"]:
         interval = settings["auto_reply_interval"]
         if await RateLimitService.can_send_reply(user_id, chat_id, interval_seconds=interval):
             await RateLimitService.update_last_reply(user_id, chat_id)
-            await message.bot.send_message(chat_id=chat_id, text=settings["auto_reply_text"], business_connection_id=conn_id)
+            
+            if is_business and conn_id:
+                await message.bot.send_message(chat_id=chat_id, text=settings["auto_reply_text"], business_connection_id=conn_id)
+            else:
+                await message.answer(settings["auto_reply_text"])
+
+# Хэндлер для обычных сообщений в ЛС с ботом
+@router.message(F.chat.type == "private")
+async def handle_private_messages(message: Message):
+    await process_auto_reply(message, is_business=False)
+
+# Хэндлер для сообщений через Telegram Business
+@router.business_message()
+async def handle_business_messages(message: Message):
+    await process_auto_reply(message, is_business=True)
 
 # ==========================================
 # 6. ЗАПУСК БОТА
