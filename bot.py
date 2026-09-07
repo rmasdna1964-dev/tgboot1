@@ -13,24 +13,19 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from supabase import create_client, Client
 
 # Настройки и ключи
-BOT_TOKEN = "8872260684:AAHEhMfCuLTfG0RK1kjmqUmDS-TXRiQUWzk"
+BOT_TOKEN = "YOUR_BOT_TOKEN"
 SUPABASE_URL = "https://uzdorwhlwihwhvnedwkj.supabase.co"
 SUPABASE_KEY = "sb_publishable_GvTORvdPKyFzSp3Kjlx2HA_9OBY9xx-"
 
-# Стоимость полного Премиум-доступа (10 Telegram Stars)
 PREMIUM_PRICE_STARS = 10
 
-# Инициализация Supabase, бота и диспетчера
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# Изолированные словари состояний (по chat_id)
-active_spams = {}    # chat_id: bool
-active_trolls = {}   # chat_id: bool
-
-# Хранилище ID пользователей с активным Премиумом
-premium_users = set()
+# Словари состояний
+active_trolls = {}    # chat_id: bool
+premium_users = set()  # set of user_id
 
 # Состояние AFK (автоответчика)
 afk_status = {"active": False, "reason": "Занят"}
@@ -50,11 +45,9 @@ TROLL_PHRASES = [
     "Спорить с тобой — это как играть в шахматы с голубем.",
     "Ты всегда такой умный или сегодня особенный день?",
     "Ага, очень интересно, продолжай (нет).",
-    "Мнение принято, отправлено в корзину.",
-    "1000-7, гуль, получается?"
+    "Мнение принято, отправлено в корзину."
 ]
 
-# Вспомогательная регистрация пользователя в Supabase
 async def get_or_create_user(user_id: int, username: str):
     try:
         response = supabase.table("profiles").select("*").eq("id", user_id).execute()
@@ -67,17 +60,15 @@ async def get_or_create_user(user_id: int, username: str):
         logging.error(f"Ошибка БД: {e}")
         return None, False
 
-# Функция отправки счета на оплату Звёздами
 async def send_premium_invoice(user_id: int):
     prices = [LabeledPrice(label="Премиум Доступ ко всем командам", amount=PREMIUM_PRICE_STARS)]
-    
     await bot.send_invoice(
         chat_id=user_id,
         title="⭐ Премиум Доступ",
-        description="Разблокировка платных функций (.killerspam, .a_troll)",
+        description="Разблокировка эксклюзивных функций бота",
         payload="premium_access",
-        provider_token="",  # Для Telegram Stars оставляем пустым
-        currency="XTR",     # Код валюты Telegram Stars
+        provider_token="",
+        currency="XTR",
         prices=prices
     )
 
@@ -146,15 +137,11 @@ async def process_pre_checkout_query(pre_checkout_query: PreCheckoutQuery):
 @dp.message(F.successful_payment)
 async def process_successful_payment(message: Message):
     user_id = message.from_user.id
-    payload = message.successful_payment.invoice_payload
-
-    if payload == "premium_access":
+    if message.successful_payment.invoice_payload == "premium_access":
         premium_users.add(user_id)
         await message.answer(
             "🎉 **Премиум доступ успешно активирован!**\n\n"
-            "Вам разблокированы все платные команды:\n"
-            "• `.killerspam [текст]`\n"
-            "• `.a_troll`",
+            "Вам разблокированы все платные функции.",
             parse_mode="Markdown"
         )
 
@@ -178,7 +165,7 @@ async def cmd_start(message: Message, state: FSMContext):
 async def process_afk_toggle_click(callback_query: CallbackQuery, state: FSMContext):
     if not afk_status["active"]:
         await state.set_state(AFKState.waiting_for_text)
-        await callback_query.message.answer("⌨️ **Напишите текст для автоответчика:**\n_(Этот текст будет отправляться всем в ЛС)_", parse_mode="Markdown")
+        await callback_query.message.answer("⌨️ **Напишите текст для автоответчика:**", parse_mode="Markdown")
         await callback_query.answer()
     else:
         await callback_query.message.answer(
@@ -205,7 +192,7 @@ async def process_afk_text_input(message: Message, state: FSMContext):
 async def process_confirm_afk_off(callback_query: CallbackQuery):
     afk_status["active"] = False
     await callback_query.message.edit_text("☀️ **Автоответчик выключен.**", parse_mode="Markdown")
-    await callback_query.answer("Автоответчик выключен!")
+    await callback_query.answer()
 
 @dp.callback_query(F.data == "cancel_afk_off")
 async def process_cancel_afk_off(callback_query: CallbackQuery):
@@ -216,18 +203,15 @@ async def process_cancel_afk_off(callback_query: CallbackQuery):
 
 @dp.callback_query(F.data == "show_help")
 async def process_help_callback(callback_query: CallbackQuery):
-    help_text = "📖 **Выберите категорию команд для просмотра:**"
-    await callback_query.message.edit_text(help_text, reply_markup=get_help_keyboard(), parse_mode="Markdown")
+    await callback_query.message.edit_text("📖 **Выберите категорию команд:**", reply_markup=get_help_keyboard(), parse_mode="Markdown")
     await callback_query.answer()
 
 @dp.callback_query(F.data == "show_free_commands")
 async def process_free_commands_callback(callback_query: CallbackQuery):
     free_text = (
-        "🆓 **Бесплатные команды:**\n\n"
-        "🚀 `.spam [текст]` — Обычный спам (задержка 1.5 сек)\n"
+        "🆓 **Доступные команды:**\n\n"
         "👤 `.info` — Информация о пользователе\n"
-        "🎮 `.starts` — Игра «Камень, ножницы, бумага»\n"
-        "🛑 `.stop` — Остановить активный спам"
+        "🎮 `.starts` — Запуск игры «Камень, ножницы, бумага»"
     )
     await callback_query.message.edit_text(free_text, reply_markup=get_back_to_help_keyboard(), parse_mode="Markdown")
     await callback_query.answer()
@@ -237,9 +221,7 @@ async def process_paid_commands_callback(callback_query: CallbackQuery):
     paid_text = (
         "⭐ **Платные Премиум-функции:**\n"
         f"_(Стоимость доступа: **{PREMIUM_PRICE_STARS} Stars**)_\n\n"
-        "⚡ `.killerspam [текст]` — Моментальный быстрый спам\n"
-        "🎭 `.a_troll` — Режим авто-троллинга собеседника\n\n"
-        "Нажмите кнопку ниже, чтобы оплатить и открыть доступ к этим командам:"
+        "🎭 `.a_troll` — Режим авто-ответа случайными фразами"
     )
     await callback_query.message.edit_text(paid_text, reply_markup=get_paid_commands_keyboard(), parse_mode="Markdown")
     await callback_query.answer()
@@ -248,16 +230,12 @@ async def process_paid_commands_callback(callback_query: CallbackQuery):
 async def process_buy_premium_callback(callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     if user_id in premium_users:
-        await callback_query.answer("У вас уже активирован Премиум доступ!", show_alert=True)
+        await callback_query.answer("У вас уже активирован Премиум!", show_alert=True)
         return
-    
     await send_premium_invoice(user_id)
-    await callback_query.answer("Счет на оплату отправлен вам в ЛС!")
+    await callback_query.answer("Счет отправлен в ЛС!")
 
-@dp.callback_query(F.data == "show_game_info")
-async def process_game_info_callback(callback_query: CallbackQuery):
-    await callback_query.message.answer("🎮 Запустите дуэль командой: `.starts`", parse_mode="Markdown")
-    await callback_query.answer()
+# --- ЛОГИКА ИГРЫ КАМЕНЬ-НОЖНИЦЫ-БУМАГА ---
 
 @dp.callback_query(lambda c: c.data and (c.data.startswith("rps_restart_") or c.data.startswith("rps_cancel_")))
 async def process_post_game_actions(callback_query: CallbackQuery):
@@ -272,11 +250,10 @@ async def process_post_game_actions(callback_query: CallbackQuery):
             parse_mode="Markdown"
         )
     elif action == "cancel":
-        if chat_id in active_games: 
-            del active_games[chat_id]
-        try: 
+        active_games.pop(chat_id, None)
+        try:
             await callback_query.message.delete()
-        except: 
+        except Exception:
             await callback_query.message.edit_text("❌ Игра завершена.")
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("rps_"))
@@ -287,47 +264,28 @@ async def process_rps_choice(callback_query: CallbackQuery):
     user_name = callback_query.from_user.first_name
 
     if chat_id not in active_games:
-        await callback_query.answer("Игра не найдена. Напишите .starts", show_alert=True)
+        await callback_query.answer("Игра не найдена. Введите .starts", show_alert=True)
         return
 
     game = active_games[chat_id]
-
     if user_id in game["choices"]:
-        await callback_query.answer("Вы уже сделали свой выбор! Ожидайте второго игрока.", show_alert=True)
+        await callback_query.answer("Вы уже сделали выбор!", show_alert=True)
         return
 
     game["choices"][user_id] = {"choice": choice, "name": user_name}
-    chosen_text = RPS_NAMES.get(choice, choice)
-    await callback_query.answer(f"Вы выбрали: {chosen_text}!")
+    await callback_query.answer(f"Вы выбрали: {RPS_NAMES.get(choice, choice)}!")
 
-    count = len(game["choices"])
-
-    if count == 1:
+    if len(game["choices"]) == 1:
         text = (
             f"🎮 **Дуэль: Камень, ножницы, бумага!**\n\n"
             f"👤 **{user_name}** сделал свой выбор!\n"
-            f"📊 Проголосовало: **1/2** игроков.\n\n"
-            f"⏳ Второму игроку нужно сделать выбор ниже:"
+            f"📊 Проголосовало: **1/2**"
         )
         await callback_query.message.edit_text(text, reply_markup=get_rps_keyboard(chat_id), parse_mode="Markdown")
 
-    elif count >= 2:
+    elif len(game["choices"]) >= 2:
         players = list(game["choices"].values())
         p1, p2 = players[0], players[1]
-
-        status_msg = (
-            f"🎮 **Дуэль: Камень, ножницы, бумага!**\n\n"
-            f"📊 Проголосовало: **2/2** игроков!\n"
-            f"✅ Оба игрока сделали выбор!\n\n"
-        )
-
-        for i in range(3, 0, -1):
-            await callback_query.message.edit_text(
-                f"{status_msg}⏳ Подведение итогов через **{i}** сек...",
-                parse_mode="Markdown"
-            )
-            await asyncio.sleep(1)
-
         c1, c2 = p1["choice"], p2["choice"]
 
         if c1 == c2:
@@ -338,18 +296,18 @@ async def process_rps_choice(callback_query: CallbackQuery):
             result = f"🏆 Победил **{p2['name']}**!"
 
         res_text = (
-            f"🎮 **Результаты дуэли:**\n\n"
-            f"👤 **{p1['name']}** выбрал: {RPS_NAMES.get(c1)}\n"
-            f"👤 **{p2['name']}** выбрал: {RPS_NAMES.get(c2)}\n\n"
+            f"🎮 **Результаты:**\n\n"
+            f"👤 **{p1['name']}**: {RPS_NAMES.get(c1)}\n"
+            f"👤 **{p2['name']}**: {RPS_NAMES.get(c2)}\n\n"
             f"{result}"
         )
         await callback_query.message.edit_text(res_text, reply_markup=get_post_game_keyboard(chat_id), parse_mode="Markdown")
 
-# --- ОСНОВНОЙ ОБРАБОТЧИК TELEGRAM BUSINESS ---
+# --- ОБРАБОТЧИК TELEGRAM BUSINESS ---
 
 @dp.business_message()
 async def handle_business_message(message: Message):
-    global active_spams, active_trolls, active_games, afk_status
+    global active_trolls, active_games, afk_status
     
     chat_id = message.chat.id
     user_id = message.from_user.id
@@ -359,39 +317,43 @@ async def handle_business_message(message: Message):
     if not conn_id:
         return
 
-    # ОПРЕДЕЛЕНИЕ АВТОРА СООБЩЕНИЯ
-    is_me = (user_id != chat_id)         # Отправили ВЫ (владелец аккаунта)
-    is_partner = (user_id == chat_id)    # Отправил СОБЕСЕДНИК
+    # Проверка автора: is_me (вы), is_partner (собеседник)
+    is_me = (user_id != chat_id)
+    is_partner = (user_id == chat_id)
 
-    # -------------------------------------------------------------
-    # 1. ЛОГИКА ДЛЯ ВАШИХ СООБЩЕНИЙ (Когда пишете ВЫ)
-    # -------------------------------------------------------------
+    # 1. Действия и команды ВЛАДЕЛЬЦА (вы)
     if is_me:
-        # Дублирование отправленного сообщения
-        if text and not text.startswith("."):
-            await bot.send_message(
-                chat_id=chat_id,
-                text=f"🔁 **Дубликат:** {text}",
-                business_connection_id=conn_id,
-                parse_mode="Markdown"
-            )
+        if text.startswith("."):
+            if text == ".info":
+                user = message.from_user
+                info_msg = (
+                    f"👤 **Ваша информация:**\n\n"
+                    f"• **Имя:** {user.first_name}\n"
+                    f"• **ID:** `{user.id}`"
+                )
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=info_msg,
+                    business_connection_id=conn_id,
+                    parse_mode="Markdown"
+                )
+                return
 
-        # Остановка спама по вашей команде
-        if text.startswith(".stop"):
-            active_spams[chat_id] = False
-            await bot.send_message(
-                chat_id=chat_id, 
-                text="🛑 Спам остановлен владельцем.", 
-                business_connection_id=conn_id
-            )
-            return
+            elif text == ".a_troll":
+                current_status = active_trolls.get(chat_id, False)
+                active_trolls[chat_id] = not current_status
+                status_text = "включен 🎭" if active_trolls[chat_id] else "выключен 🛑"
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"Режим авто-ответов **{status_text}**",
+                    business_connection_id=conn_id,
+                    parse_mode="Markdown"
+                )
+                return
 
-    # -------------------------------------------------------------
-    # 2. ЛОГИКА ДЛЯ СООБЩЕНИЙ СОБЕСЕДНИКА (Когда пишет СОБЕСЕДНИК)
-    # -------------------------------------------------------------
+    # 2. Действия и команды СОБЕСЕДНИКА
     if is_partner:
-
-        # Автоответчик (AFK)
+        # Автоответчик AFK
         if afk_status["active"] and message.chat.type == "private":
             await bot.send_message(
                 chat_id=chat_id,
@@ -399,7 +361,7 @@ async def handle_business_message(message: Message):
                 business_connection_id=conn_id
             )
 
-        # Режим авто-троллинга
+        # Авто-ответы из списка TROLL_PHRASES
         if active_trolls.get(chat_id, False):
             await bot.send_message(
                 chat_id=chat_id,
@@ -407,32 +369,14 @@ async def handle_business_message(message: Message):
                 business_connection_id=conn_id
             )
 
-        # ОБРАБОТКА КОМАНД СОБЕСЕДНИКА
         if text.startswith("."):
-            
-            # --- Бесплатные команды ---
-            
-            if text.startswith(".spam"):
-                msg = text[5:].strip()
-                if msg:
-                    active_spams[chat_id] = True
-                    while active_spams.get(chat_id, False):
-                        await bot.send_message(
-                            chat_id=chat_id, 
-                            text=msg, 
-                            business_connection_id=conn_id
-                        )
-                        await asyncio.sleep(1.5)
-                return
-
-            elif text == ".info":
+            if text == ".info":
                 user = message.from_user
                 info_msg = (
                     f"👤 **Информация о собеседнике:**\n\n"
                     f"• **Имя:** {user.first_name}\n"
                     f"• **ID:** `{user.id}`\n"
-                    f"• **Username:** @{user.username if user.username else 'отсутствует'}\n"
-                    f"• **Премиум:** {'Да' if user.is_premium else 'Нет'}"
+                    f"• **Премиум:** {'Да' if user_id in premium_users else 'Нет'}"
                 )
                 await bot.send_message(
                     chat_id=chat_id,
@@ -446,44 +390,11 @@ async def handle_business_message(message: Message):
                 active_games[chat_id] = {"choices": {}}
                 await bot.send_message(
                     chat_id=chat_id,
-                    text="🎮 **Дуэль: Камень, ножницы, бумага!**\n\n⏳ Ожидание игроков...\n📊 Проголосовало: **0/2**",
+                    text="🎮 **Дуэль: Камень, ножницы, бумага!**\n\n⏳ Ожидание игроков...",
                     reply_markup=get_rps_keyboard(chat_id),
                     business_connection_id=conn_id,
                     parse_mode="Markdown"
                 )
-                return
-
-            elif text == ".stop":
-                active_spams[chat_id] = False
-                await bot.send_message(
-                    chat_id=chat_id, 
-                    text="🛑 Спам остановлен.", 
-                    business_connection_id=conn_id
-                )
-                return
-
-            # --- Платные Премиум команды ---
-
-            elif text.startswith(".killerspam"):
-                if user_id not in premium_users:
-                    await send_premium_invoice(user_id)
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text=f"⭐ **Команда доступна только Премиум-пользователям!**\nСчет на оплату ({PREMIUM_PRICE_STARS} Stars) отправлен вам в ЛС.",
-                        business_connection_id=conn_id
-                    )
-                    return
-
-                msg = text[11:].strip()
-                if msg:
-                    active_spams[chat_id] = True
-                    while active_spams.get(chat_id, False):
-                        await bot.send_message(
-                            chat_id=chat_id, 
-                            text=msg, 
-                            business_connection_id=conn_id
-                        )
-                        await asyncio.sleep(0.01)
                 return
 
             elif text == ".a_troll":
@@ -491,7 +402,7 @@ async def handle_business_message(message: Message):
                     await send_premium_invoice(user_id)
                     await bot.send_message(
                         chat_id=chat_id,
-                        text=f"⭐ **Команда доступна только Премиум-пользователям!**\nСчет на оплату ({PREMIUM_PRICE_STARS} Stars) отправлен вам в ЛС.",
+                        text=f"⭐ **Команда доступна только Премиум-пользователям!**\nСчет ({PREMIUM_PRICE_STARS} Stars) отправлен в ЛС.",
                         business_connection_id=conn_id
                     )
                     return
@@ -501,7 +412,7 @@ async def handle_business_message(message: Message):
                 status_text = "включен 🎭" if active_trolls[chat_id] else "выключен 🛑"
                 await bot.send_message(
                     chat_id=chat_id,
-                    text=f"Режим авто-троллинга **{status_text}**",
+                    text=f"Режим авто-ответов **{status_text}**",
                     business_connection_id=conn_id,
                     parse_mode="Markdown"
                 )
