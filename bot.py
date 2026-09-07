@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import random
 import os
 
 from aiogram import Bot, Dispatcher, F
@@ -14,302 +13,164 @@ from aiogram.types import (
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from supabase import create_client, Client
 
-# ============================================================
-# НАСТРОЙКИ И АВТОМАТИЧЕСКАЯ ПОДСТАНОВКА ТОКЕНА
-# ============================================================
-
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-
-if not BOT_TOKEN:
-    BOT_TOKEN = "8955553619:AAGPRoVXir741kBwfYcGg6GlJhI4WzezK2Y".strip()
-
-SUPABASE_URL = "https://uzdorwhlwihwhvnedwkj.supabase.co"
-SUPABASE_KEY = "sb_publishable_GvTORvdPKyFzSp3Kjlx2HA_9OBY9xx-"
-
-# ============================================================
-# ИНИЦИАЛИЗАЦИЯ
-# ============================================================
-
-supabase: Client = create_client(
-    SUPABASE_URL,
-    SUPABASE_KEY
-)
+# Токен бота
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8955553619:AAGPRoVXir741kBwfYcGg6GlJhI4WzezK2Y").strip()
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# ============================================================
-# ХРАНИЛИЩА И FSM
-# ============================================================
+# Состояние активных спам-процессов: {chat_id: bool}
+active_spams = {}
 
-autoresponder = {
-    "active": False,
-    "text": "Привет! Сейчас я занят и отвечу позже."
-}
-
-active_trolls = {}
-is_ghouling = {}
-is_spamming = {}
-notes = {}
-active_games = {}
-
-class AutoresponderState(StatesGroup):
+class SpamState(StatesGroup):
+    waiting_for_target = State()
     waiting_for_text = State()
-
-TROLL_PHRASES = [
-    "Спорить с тобой — это как играть в шахматы с голубем.",
-    "Ты всегда такой умный или сегодня особенный день?",
-    "Ага, очень интересно, продолжай.",
-    "Мнение принято.",
-    "1000-7..."
-]
+    confirm_spam = State()
 
 # ============================================================
-# SUPABASE & КЛАВИАТУРЫ
+# КЛАВИАТУРЫ
 # ============================================================
-
-async def get_or_create_user(user_id: int, username: str):
-    try:
-        response = supabase.table("profiles").select("*").eq("id", user_id).execute()
-        if not response.data:
-            new_user = {"id": user_id, "username": username, "balance": 100}
-            data = supabase.table("profiles").insert(new_user).execute()
-            if data.data:
-                return data.data[0], True
-            return None, False
-        return response.data[0], False
-    except Exception as e:
-        logging.error(f"Ошибка Supabase: {e}")
-        return None, False
 
 def get_main_keyboard():
-    ar_text = "🔴 Отключить автоответчик" if autoresponder["active"] else "🟢 Включить автоответчик"
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=ar_text, callback_data="toggle_ar_panel")],
+            [InlineKeyboardButton(text="🚀 Запустить спам", callback_data="start_spam_flow")],
+            [InlineKeyboardButton(text="🛑 Остановить текущий спам", callback_data="stop_spam")],
+            [InlineKeyboardButton(text="📖 Инструкция", callback_data="show_instruction")]
+        ]
+    )
+
+def get_confirm_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
             [
-                InlineKeyboardButton(text="📖 Инструкция", callback_data="show_help"),
-                InlineKeyboardButton(text="🎮 Игра", callback_data="show_game_info")
+                InlineKeyboardButton(text="✅ Пуск", callback_data="confirm_start"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data="cancel_spam")
             ]
         ]
     )
 
-def get_confirm_turnoff_keyboard():
+def get_cancel_only_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Да, отключить", callback_data="confirm_ar_off"),
-                InlineKeyboardButton(text="❌ Нет", callback_data="cancel_ar_off")
-            ]
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_spam")]
         ]
     )
 
 # ============================================================
-# ОБРАБОТЧИКИ
+# ОБРАБОТКА МЕНЮ И FSM
 # ============================================================
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    user_id = message.from_user.id
-    username = message.from_user.username or "Аноним"
-    await get_or_create_user(user_id, username)
-
-    status = "ВКЛЮЧЕН 🟢" if autoresponder["active"] else "ВЫКЛЮЧЕН 🔴"
-    text = f"👋 Привет, {message.from_user.first_name}!\n\n🤖 Панель управления\n\nАвтоответчик: **{status}**"
-    if autoresponder["active"]:
-        text += f"\n\n💬 Текст:\n{autoresponder['text']}"
-
-    await message.answer(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
-
-@dp.callback_query(F.data == "toggle_ar_panel")
-async def process_ar_toggle(callback: CallbackQuery, state: FSMContext):
-    if not autoresponder["active"]:
-        await state.set_state(AutoresponderState.waiting_for_text)
-        await callback.message.answer("⌨️ **Напиши текст для автоответчика.**", parse_mode="Markdown")
-    else:
-        await callback.message.answer("⚠️ **Отключить автоответчик?**", reply_markup=get_confirm_turnoff_keyboard(), parse_mode="Markdown")
-    await callback.answer()
-
-@dp.message(AutoresponderState.waiting_for_text)
-async def process_ar_text(message: Message, state: FSMContext):
-    global autoresponder
-    text = (message.text or "").strip()
-    if not text:
-        await message.answer("❌ Текст не может быть пустым.")
-        return
-
-    autoresponder["active"] = True
-    autoresponder["text"] = text
-    await state.clear()
-    await message.answer(f"✅ **Автоответчик включён!**\n\n💬 Текст:\n{text}", reply_markup=get_main_keyboard(), parse_mode="Markdown")
-
-@dp.callback_query(F.data == "confirm_ar_off")
-async def confirm_ar_off(callback: CallbackQuery):
-    autoresponder["active"] = False
-    await callback.message.edit_text("☀️ **Автоответчик отключён.**", parse_mode="Markdown")
-    await callback.answer("Автоответчик выключен!")
-
-@dp.callback_query(F.data == "cancel_ar_off")
-async def cancel_ar_off(callback: CallbackQuery):
-    await callback.message.edit_text("👍 Автоответчик остался **включённым**.", parse_mode="Markdown")
-    await callback.answer()
-
-@dp.callback_query(F.data == "show_help")
-async def show_help(callback: CallbackQuery):
-    text = (
-        "📖 **Команды бота**\n\n"
-        "⚡ `.spam <кол-во> <текст>` — Моментальный спам сообщениями.\n"
-        "🛑 `.stopspam` — Остановить спам.\n"
-        "🤖 Автоответчик — Переключается в меню.\n"
-        "👤 `.info` — Информация о собеседнике.\n"
-        "🎭 `.a_troll` — Вкл/выкл авто-троллинг.\n"
-        "🔢 `.ghoul` — Запустить 1000-7.\n"
-        "🛑 `.ghoulstop` — Остановить 1000-7.\n"
-        "📌 `.note имя текст` — Сохранить заметку.\n"
-        "📌 `.get имя` — Получить заметку."
+    await message.answer(
+        "👋 **Главное меню управления**\n\nВыбери нужное действие ниже:",
+        reply_markup=get_main_keyboard(),
+        parse_mode="Markdown"
     )
-    await callback.message.answer(text, parse_mode="Markdown")
+
+@dp.callback_query(F.data == "show_instruction")
+async def show_instruction(callback: CallbackQuery):
+    text = (
+        "📖 **Инструкция по настройке и работе:**\n\n"
+        "1️⃣ **Telegram Business (Подключение к ЛС):**\n"
+        "• Открой Настройки Telegram ➔ **Telegram для бизнеса**.\n"
+        "• Перейди в раздел **Чат-боты** и добавь этого бота.\n"
+        "• Выбери «Все чаты», чтобы бот мог отправлять сообщения от твоего имени.\n\n"
+        "2️⃣ **Запуск спама из меню:**\n"
+        "• Нажми кнопку **«🚀 Запустить спам»**.\n"
+        "• Введи `@username` или `ID` цели.\n"
+        "• Введи текст сообщения.\n"
+        "• Подтверди запуск кнопкой **«✅ Пуск»**.\n\n"
+        "3️⃣ **Остановка:**\n"
+        "• В любой момент нажми **«🛑 Остановить текущий спам»**."
+    )
+    await callback.message.edit_text(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
     await callback.answer()
 
-# ============================================================
-# ЕДИНАЯ ЛОГИКА КОМАНД И МОМЕНТАЛЬНОГО СПАМА
-# ============================================================
+@dp.callback_query(F.data == "start_spam_flow")
+async def start_spam_flow(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(SpamState.waiting_for_target)
+    await callback.message.edit_text(
+        "👤 **Шаг 1 из 2:**\nВведи **Username** (например `@username`) или **ID** человека, которому нужно отправлять сообщения:",
+        reply_markup=get_cancel_only_keyboard(),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
 
-async def handle_custom_logic(chat_id: int, user_id: int, text: str, is_business: bool = False, business_connection_id: str = None):
-    async def send_msg(msg_text: str, **kwargs):
-        if is_business and business_connection_id:
-            await bot.send_message(chat_id=chat_id, text=msg_text, business_connection_id=business_connection_id, **kwargs)
-        else:
-            await bot.send_message(chat_id=chat_id, text=msg_text, **kwargs)
+@dp.message(SpamState.waiting_for_target)
+async def process_target(message: Message, state: FSMContext):
+    target = message.text.strip()
+    await state.update_data(target=target)
+    await state.set_state(SpamState.waiting_for_text)
+    await message.answer(
+        f"💬 **Шаг 2 из 2:**\nЦель: `{target}`\n\nТеперь напиши **текст сообщения** для спама:",
+        reply_markup=get_cancel_only_keyboard(),
+        parse_mode="Markdown"
+    )
 
-    # Работа с командами через точку
-    if text.startswith("."):
-        if text.startswith(".spam"):
-            parts = text[5:].strip().split(maxsplit=1)
-            if len(parts) < 2 or not parts[0].isdigit():
-                await send_msg("❌ **Формат команды:**\n`.spam 10 Текст для спама`", parse_mode="Markdown")
-                return True
+@dp.message(SpamState.waiting_for_text)
+async def process_text(message: Message, state: FSMContext):
+    spam_text = message.text.strip()
+    await state.update_data(spam_text=spam_text)
+    
+    data = await state.get_data()
+    target = data.get("target")
+    
+    await state.set_state(SpamState.confirm_spam)
+    await message.answer(
+        f"⚙️ **Подтверждение запуска:**\n\n"
+        f"🎯 **Цель:** `{target}`\n"
+        f"📝 **Текст:** {spam_text}\n\n"
+        f"Нажми **«Пуск»** для начала или **«Отклонить»** для отмены.",
+        reply_markup=get_confirm_keyboard(),
+        parse_mode="Markdown"
+    )
 
-            count = int(parts[0])
-            spam_msg = parts[1]
+@dp.callback_query(F.data == "confirm_start", SpamState.confirm_spam)
+async def confirm_start(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    target = data.get("target")
+    spam_text = data.get("spam_text")
+    await state.clear()
 
-            if count <= 0:
-                await send_msg("❌ Количество должно быть больше 0.")
-                return True
+    chat_id = callback.message.chat.id
+    active_spams[chat_id] = True
 
-            count = min(count, 100)
-            is_spamming[chat_id] = True
+    await callback.message.edit_text(
+        f"🚀 **Спам запущен!**\nЦель: `{target}`\n\nДля остановки нажми кнопку ниже.",
+        reply_markup=get_main_keyboard(),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
 
-            await send_msg(f"🚀 **Запуск спама:** {count} сообщений...", parse_mode="Markdown")
+    # Запуск цикла спама
+    for _ in range(50):
+        if not active_spams.get(chat_id, False):
+            break
+        try:
+            await bot.send_message(chat_id=target, text=spam_text)
+            await asyncio.sleep(0.2)
+        except Exception as e:
+            await callback.message.answer(f"❌ Ошибка отправки на `{target}`: {e}")
+            break
 
-            for _ in range(count):
-                if not is_spamming.get(chat_id, False):
-                    break
-                try:
-                    await send_msg(spam_msg)
-                except Exception as e:
-                    logging.error(f"Ошибка при спаме: {e}")
-                    break
+    active_spams[chat_id] = False
 
-            is_spamming[chat_id] = False
-            return True
+@dp.callback_query(F.data == "cancel_spam")
+async def cancel_spam(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("❌ **Операция отменена.**", reply_markup=get_main_keyboard(), parse_mode="Markdown")
+    await callback.answer("Отменено")
 
-        if text == ".stopspam":
-            is_spamming[chat_id] = False
-            await send_msg("🛑 **Спам остановлен.**", parse_mode="Markdown")
-            return True
-
-        if text == ".info":
-            chat = await bot.get_chat(chat_id)
-            username = f"@{chat.username}" if chat.username else "отсутствует"
-            first_name = chat.first_name or "Не указано"
-            last_name = chat.last_name or ""
-            full_name = f"{first_name} {last_name}".strip()
-
-            info_text = (
-                f"👤 **ИНФОРМАЦИЯ О СОБЕСЕДНИКЕ**\n\n"
-                f"📝 Имя: **{full_name}**\n"
-                f"🆔 ID: `{chat.id}`\n"
-                f"🔗 Username: {username}\n"
-                f"💬 Тип чата: `{chat.type}`"
-            )
-            await send_msg(info_text, parse_mode="Markdown")
-            return True
-
-        if text == ".ghoulstop":
-            is_ghouling[chat_id] = False
-            await send_msg("🛑 **Цикл 1000-7 остановлен.**", parse_mode="Markdown")
-            return True
-
-        if text == ".ghoul":
-            if is_ghouling.get(chat_id, False):
-                return True
-            is_ghouling[chat_id] = True
-            value = 1000
-            while value > 0 and is_ghouling.get(chat_id, False):
-                await send_msg(f"{value} - 7 = {value - 7}")
-                value -= 7
-                await asyncio.sleep(0.3)
-            is_ghouling[chat_id] = False
-            return True
-
-        if text == ".a_troll":
-            current = active_trolls.get(chat_id, False)
-            active_trolls[chat_id] = not current
-            status = "включён 🎭" if active_trolls[chat_id] else "выключен 🛑"
-            await send_msg(f"🎭 Авто-троллинг **{status}**", parse_mode="Markdown")
-            return True
-
-        if text.startswith(".note"):
-            args = text[5:].strip().split(maxsplit=1)
-            if len(args) != 2:
-                await send_msg("❌ Использование:\n`.note имя текст`", parse_mode="Markdown")
-                return True
-            name, note_text = args[0].lower(), args[1]
-            notes[name] = note_text
-            await send_msg(f"📌 Заметка **{name}** сохранена.", parse_mode="Markdown")
-            return True
-
-        if text.startswith(".get"):
-            name = text[4:].strip().lower()
-            if not name:
-                await send_msg("❌ Использование:\n`.get имя`", parse_mode="Markdown")
-                return True
-            result = notes.get(name, f"❌ Заметка **{name}** не найдена.")
-            await send_msg(result, parse_mode="Markdown")
-            return True
-
-    # Реакция на входящие сообщения
-    if autoresponder["active"]:
-        await send_msg(autoresponder["text"])
-
-    if active_trolls.get(chat_id, False):
-        await send_msg(random.choice(TROLL_PHRASES))
-
-    return False
-
-@dp.business_message()
-async def handle_business_message(message: Message):
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-    text = (message.text or "").strip()
-    conn_id = message.business_connection_id
-
-    if not conn_id:
-        return
-
-    await handle_custom_logic(chat_id, user_id, text, is_business=True, business_connection_id=conn_id)
-
-@dp.message(F.text)
-async def handle_regular_message(message: Message):
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-    text = (message.text or "").strip()
-
-    await handle_custom_logic(chat_id, user_id, text, is_business=False)
+@dp.callback_query(F.data == "stop_spam")
+async def stop_spam(callback: CallbackQuery):
+    chat_id = callback.message.chat.id
+    active_spams[chat_id] = False
+    await callback.message.answer("🛑 **Запрос на остановку отправлен.**")
+    await callback.answer()
 
 # ============================================================
 # ЗАПУСК
