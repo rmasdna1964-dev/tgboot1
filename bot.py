@@ -2,8 +2,7 @@ import asyncio
 import logging
 import os
 import random
-import aiosqlite
-from typing import Optional, Dict, Any
+from typing import Dict, Any, Optional
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
@@ -17,18 +16,19 @@ from aiogram.types import (
 )
 from aiogram.client.default import DefaultBotProperties
 
+
 # ============================================================
-# НАСТРОЙКИ И ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
+# НАСТРОЙКИ
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-# Укажи свой Telegram ID для доступа к администрированию через ЛС
 OWNER_ID = int(os.getenv("OWNER_ID", "0").strip() or 0)
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN не найден. Добавь BOT_TOKEN в переменные окружения.")
+    raise RuntimeError(
+        "BOT_TOKEN не найден. Добавь BOT_TOKEN в Secrets/Environment Variables."
+    )
 
-DB_PATH = "bot_database.db"
 
 # ============================================================
 # ИНИЦИАЛИЗАЦИЯ
@@ -43,73 +43,22 @@ bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(parse_mode="HTML")
 )
+
 dp = Dispatcher()
 
-# Кеш для Business Connections в оперативной памяти
+
+# ============================================================
+# ПАМЯТЬ БОТА
+# ============================================================
+
+business_owners: Dict[str, int] = {}
 business_connections: Dict[str, Any] = {}
+autoresponders: Dict[int, Dict[str, Any]] = {}
+active_games: Dict[int, Dict[str, Any]] = {}
+active_trolls: Dict[int, bool] = {}
+is_ghouling: Dict[int, bool] = {}
+notes: Dict[int, list] = {}
 
-# ============================================================
-# РАБОТА С БАЗОЙ ДАННЫХ (SQLite)
-# ============================================================
-
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        # Таблица настроек чата (автоответчик, режими ghoul/troll)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS chat_settings (
-                chat_id INTEGER PRIMARY KEY,
-                ar_enabled INTEGER DEFAULT 0,
-                ar_text TEXT DEFAULT 'Я сейчас не могу ответить.',
-                is_ghoul INTEGER DEFAULT 0,
-                is_troll INTEGER DEFAULT 0
-            )
-        """)
-        # Таблица заметок
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS notes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER,
-                text TEXT
-            )
-        """)
-        await db.commit()
-
-async def get_chat_settings(chat_id: int) -> dict:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT ar_enabled, ar_text, is_ghoul, is_troll FROM chat_settings WHERE chat_id = ?",
-            (chat_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            if row:
-                return {"ar_enabled": bool(row[0]), "ar_text": row[1], "is_ghoul": bool(row[2]), "is_troll": bool(row[3])}
-            return {"ar_enabled": False, "ar_text": "Я сейчас не могу ответить.", "is_ghoul": False, "is_troll": False}
-
-async def update_chat_setting(chat_id: int, **kwargs):
-    current = await get_chat_settings(chat_id)
-    current.update(kwargs)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT INTO chat_settings (chat_id, ar_enabled, ar_text, is_ghoul, is_troll)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(chat_id) DO UPDATE SET
-                ar_enabled=excluded.ar_enabled,
-                ar_text=excluded.ar_text,
-                is_ghoul=excluded.is_ghoul,
-                is_troll=excluded.is_troll
-        """, (chat_id, int(current["ar_enabled"]), current["ar_text"], int(current["is_ghoul"]), int(current["is_troll"])))
-        await db.commit()
-
-async def add_note(chat_id: int, text: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO notes (chat_id, text) VALUES (?, ?)", (chat_id, text))
-        await db.commit()
-
-async def get_notes(chat_id: int) -> list:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT text FROM notes WHERE chat_id = ?", (chat_id,)) as cursor:
-            rows = await cursor.fetchall()
-            return [r[0] for r in rows]
 
 # ============================================================
 # FSM И КЛАВИАТУРЫ
@@ -118,13 +67,16 @@ async def get_notes(chat_id: int) -> list:
 class AutoResponderState(StatesGroup):
     waiting_text = State()
 
+
 def main_panel() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🤖 Автоответчик", callback_data="panel_autoresponder")],
-            [InlineKeyboardButton(text="ℹ️ Помощь по командам", callback_data="panel_help")],
+            [InlineKeyboardButton(text="🎮 Камень-ножницы-бумага", callback_data="panel_rps")],
+            [InlineKeyboardButton(text="ℹ️ Помощь", callback_data="panel_help")],
         ]
     )
+
 
 def autoresponder_keyboard(enabled: bool) -> InlineKeyboardMarkup:
     btn_text = "🔴 Отключить автоответчик" if enabled else "🟢 Включить автоответчик"
@@ -137,6 +89,7 @@ def autoresponder_keyboard(enabled: bool) -> InlineKeyboardMarkup:
         ]
     )
 
+
 def disable_confirm_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -147,23 +100,46 @@ def disable_confirm_keyboard() -> InlineKeyboardMarkup:
         ]
     )
 
+
+def rps_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🪨 Камень", callback_data=f"rps:rock:{chat_id}")],
+            [InlineKeyboardButton(text="✂️ Ножницы", callback_data=f"rps:scissors:{chat_id}")],
+            [InlineKeyboardButton(text="📄 Бумага", callback_data=f"rps:paper:{chat_id}")],
+        ]
+    )
+
+
+def rps_after_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🎮 Играть ещё", callback_data=f"rps_again:{chat_id}")],
+            [InlineKeyboardButton(text="❌ Отказаться", callback_data=f"rps_cancel:{chat_id}")]
+        ]
+    )
+
+
 # ============================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ВПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И ОТПРАВКА
 # ============================================================
 
 async def get_connection_info(connection_id: str):
     if not connection_id:
         return None
+
     if connection_id in business_connections:
         return business_connections[connection_id]
 
     try:
         connection = await bot.get_business_connection(business_connection_id=connection_id)
         business_connections[connection_id] = connection
+        business_owners[connection_id] = connection.user.id
         return connection
     except Exception:
         logging.exception("Ошибка получения Business Connection")
         return None
+
 
 async def send_reply(
     chat_id: int,
@@ -179,8 +155,68 @@ async def send_reply(
 
     return await bot.send_message(**kwargs)
 
+
 # ============================================================
-# ЛОГИКА ОБРАБОТКИ
+# КАМЕНЬ-НОЖНИЦЫ-БУМАГА (RPS)
+# ============================================================
+
+RPS_NAMES = {"rock": "🪨 Камень", "scissors": "✂️ Ножницы", "paper": "📄 Бумага"}
+
+def rps_winner(choice1: str, choice2: str) -> str:
+    if choice1 == choice2:
+        return "draw"
+    wins = {"rock": "scissors", "scissors": "paper", "paper": "rock"}
+    return "first" if wins[choice1] == choice2 else "second"
+
+
+async def start_rps(chat_id: int, connection_id: Optional[str] = None):
+    active_games[chat_id] = {"choices": {}, "connection_id": connection_id, "started": True}
+    await send_reply(
+        chat_id,
+        "🎮 <b>Камень-ножницы-бумага</b>\n\n👥 Игроки: <b>0/2 готовы</b>\n\nКаждый игрок должен сделать выбор.",
+        connection_id,
+        rps_keyboard(chat_id)
+    )
+
+
+async def finish_rps(chat_id: int):
+    game = active_games.get(chat_id)
+    if not game or len(game["choices"]) < 2:
+        return
+
+    connection_id = game.get("connection_id")
+    await send_reply(chat_id, "✅ <b>2/2 игрока готовы!</b>\n\n⏳ Определяем победителя...", connection_id)
+
+    for i in [2, 1]:
+        await asyncio.sleep(1)
+        try:
+            await send_reply(chat_id, f"⏳ <b>{i}</b>", connection_id)
+        except Exception:
+            pass
+
+    await asyncio.sleep(0.5)
+    players = list(game["choices"].keys())
+    choice1, choice2 = game["choices"][players[0]], game["choices"][players[1]]
+    result = rps_winner(choice1, choice2)
+
+    if result == "draw":
+        result_text = "🤝 <b>Ничья!</b>"
+    elif result == "first":
+        result_text = f"🏆 Победил игрок <code>{players[0]}</code>!"
+    else:
+        result_text = f"🏆 Победил игрок <code>{players[1]}</code>!"
+
+    text = (
+        f"🎮 <b>Результат</b>\n\n"
+        f"👤 Игрок 1: <b>{RPS_NAMES[choice1]}</b>\n"
+        f"👤 Игрок 2: <b>{RPS_NAMES[choice2]}</b>\n\n"
+        f"{result_text}"
+    )
+    await send_reply(chat_id, text, connection_id, rps_after_keyboard(chat_id))
+
+
+# ============================================================
+# ОБРАБОТКА КОМАНД И АВТООТВЕТЧИКА
 # ============================================================
 
 async def process_command_or_autorespond(message: Message, is_owner: bool, connection_id: Optional[str] = None):
@@ -188,7 +224,7 @@ async def process_command_or_autorespond(message: Message, is_owner: bool, conne
     chat_id = message.chat.id
     lower = text.lower()
 
-    # 1. КОМАНДЫ УПРАВЛЕНИЯ (Только для владельца)
+    # 1. КОМАНДЫ ВЛАДЕЛЬЦА
     if is_owner and text.startswith("."):
         if lower.startswith(".spam"):
             parts = text.split(maxsplit=1)
@@ -196,7 +232,7 @@ async def process_command_or_autorespond(message: Message, is_owner: bool, conne
                 await send_reply(chat_id, "❌ Укажите текст: <code>.spam текст</code>", connection_id)
                 return True
             spam_text = parts[1].strip()
-            await update_chat_setting(chat_id, ar_enabled=True, ar_text=spam_text)
+            autoresponders[chat_id] = {"enabled": True, "text": spam_text}
             await send_reply(chat_id, f"✅ <b>Автоответчик включён:</b>\n<blockquote>{spam_text}</blockquote>", connection_id)
             return True
 
@@ -204,7 +240,7 @@ async def process_command_or_autorespond(message: Message, is_owner: bool, conne
             user = message.from_user
             username = f"@{user.username}" if user and user.username else "нет"
             info_text = (
-                f"ℹ️ <b>Инфо о собеседнике</b>\n\n"
+                f"ℹ️ <b>Информация о пользователе</b>\n\n"
                 f"👤 Имя: <b>{user.full_name if user else 'Неизвестно'}</b>\n"
                 f"🆔 ID: <code>{user.id if user else 'N/A'}</code>\n"
                 f"🔗 Username: {username}\n"
@@ -213,56 +249,56 @@ async def process_command_or_autorespond(message: Message, is_owner: bool, conne
             await send_reply(chat_id, info_text, connection_id)
             return True
 
+        if lower == ".starts":
+            await start_rps(chat_id, connection_id)
+            return True
+
         if lower == ".ghoul":
-            await update_chat_setting(chat_id, is_ghoul=True)
-            await send_reply(chat_id, "👻 <b>Режим Ghoul включён.</b>", connection_id)
+            is_ghouling[chat_id] = True
+            await send_reply(chat_id, "👻 <b>Ghoul включён.</b>", connection_id)
             return True
 
         if lower == ".ghoulstop":
-            await update_chat_setting(chat_id, is_ghoul=False)
-            await send_reply(chat_id, "👻 <b>Режим Ghoul выключен.</b>", connection_id)
+            is_ghouling[chat_id] = False
+            await send_reply(chat_id, "👻 <b>Ghoul выключен.</b>", connection_id)
             return True
 
         if lower == ".a_troll":
-            settings = await get_chat_settings(chat_id)
-            new_troll_state = not settings["is_troll"]
-            await update_chat_setting(chat_id, is_troll=new_troll_state)
-            status_str = "включён" if new_troll_state else "выключен"
-            await send_reply(chat_id, f"😈 <b>Режим Troll {status_str}.</b>", connection_id)
+            active_trolls[chat_id] = True
+            await send_reply(chat_id, "😈 <b>A-Troll включён.</b>", connection_id)
             return True
 
         if lower.startswith(".note"):
             parts = text.split(maxsplit=1)
             if len(parts) >= 2:
-                await add_note(chat_id, parts[1].strip())
+                notes.setdefault(chat_id, []).append(parts[1].strip())
                 await send_reply(chat_id, "📝 <b>Заметка сохранена.</b>", connection_id)
             return True
 
         if lower == ".get":
-            user_notes = await get_notes(chat_id)
+            user_notes = notes.get(chat_id, [])
             out = "📝 Заметок нет." if not user_notes else "📝 <b>Заметки:</b>\n\n" + "\n".join(f"{i+1}. {n}" for i, n in enumerate(user_notes))
             await send_reply(chat_id, out, connection_id)
             return True
 
-    # 2. АВТООТВЕТЫ И СПЕЦРЕЖИМЫ (На сообщения собеседника)
+    # 2. АВТООТВЕТЫ ДЛЯ СОБЕСЕДНИКОВ
     if not is_owner:
-        settings = await get_chat_settings(chat_id)
-
-        if settings["ar_enabled"] and settings["ar_text"]:
+        ar = autoresponders.get(chat_id)
+        if ar and ar.get("enabled") and ar.get("text"):
             try:
-                await send_reply(chat_id, settings["ar_text"], connection_id)
+                await send_reply(chat_id, ar["text"], connection_id)
             except Exception:
                 pass
             return True
 
-        if settings["is_ghoul"]:
+        if is_ghouling.get(chat_id):
             try:
                 await send_reply(chat_id, "👻 Ты написал в пустоту...", connection_id)
             except Exception:
                 pass
             return True
 
-        if settings["is_troll"]:
+        if active_trolls.get(chat_id):
             troll_msgs = ["😈 Я всё вижу.", "👀 Интересно...", "🤨 Ты точно хотел это написать?", "🗿 Понял."]
             try:
                 await send_reply(chat_id, random.choice(troll_msgs), connection_id)
@@ -272,16 +308,15 @@ async def process_command_or_autorespond(message: Message, is_owner: bool, conne
 
     return False
 
+
 # ============================================================
-# ХЭНДЛЕРЫ МЕНЮ И ПАНЕЛИ УПРАВЛЕНИЯ
+# START & PANEL
 # ============================================================
 
 @dp.message(CommandStart())
 async def start_command(message: Message):
-    if OWNER_ID != 0 and message.from_user.id != OWNER_ID:
-        await message.answer("🔒 Доступ ограничен.")
-        return
-    await message.answer("👻 <b>Панель управления ботом</b>", reply_markup=main_panel())
+    await message.answer("👻 <b>Теневой бот</b>\n\nПанель управления:", reply_markup=main_panel())
+
 
 @dp.callback_query(F.data == "back_main")
 async def back_main(callback: CallbackQuery):
@@ -291,18 +326,20 @@ async def back_main(callback: CallbackQuery):
     except Exception:
         pass
 
+
 @dp.callback_query(F.data == "panel_help")
 async def panel_help(callback: CallbackQuery):
     await callback.answer()
     text = (
-        "ℹ️ <b>Команды управления в чатах:</b>\n\n"
-        "<code>.spam текст</code> — включить автоответчик с текстом\n"
-        "<code>.info</code> — информация о собеседнике\n"
-        "<code>.ghoul</code> — включить режим Ghoul\n"
-        "<code>.ghoulstop</code> — выключить режим Ghoul\n"
-        "<code>.a_troll</code> — переключить режим Troll\n"
-        "<code>.note текст</code> — сохранить заметку в чате\n"
-        "<code>.get</code> — показать заметки чата"
+        "ℹ️ <b>Команды</b>\n\n"
+        "<code>.spam текст</code> — включить автоответчик\n"
+        "<code>.info</code> — инфо о собеседнике\n"
+        "<code>.starts</code> — начать КНБ\n"
+        "<code>.ghoul</code> — режим ghoul\n"
+        "<code>.ghoulstop</code> — выключить ghoul\n"
+        "<code>.a_troll</code> — включить troll\n"
+        "<code>.note текст</code> — сохранить заметку\n"
+        "<code>.get</code> — показать заметки"
     )
     try:
         await callback.message.edit_text(
@@ -312,24 +349,26 @@ async def panel_help(callback: CallbackQuery):
     except Exception:
         pass
 
+
 @dp.callback_query(F.data == "panel_autoresponder")
 async def panel_autoresponder(callback: CallbackQuery):
     await callback.answer()
     chat_id = callback.message.chat.id
-    settings = await get_chat_settings(chat_id)
-    status = "🟢 ВКЛЮЧЕН" if settings["ar_enabled"] else "🔴 ВЫКЛЮЧЕН"
-    
-    text = f"🤖 <b>Автоответчик</b>\n\nСтатус: <b>{status}</b>\n\nТекст:\n<blockquote>{settings['ar_text']}</blockquote>"
+    data = autoresponders.get(chat_id, {"enabled": False, "text": "Я сейчас не могу ответить."})
+    status = "🟢 ВКЛЮЧЕН" if data["enabled"] else "🔴 ВЫКЛЮЧЕН"
+    text = f"🤖 <b>Автоответчик</b>\n\nСтатус: <b>{status}</b>\n\nТекст:\n<blockquote>{data['text']}</blockquote>"
     try:
-        await callback.message.edit_text(text, reply_markup=autoresponder_keyboard(settings["ar_enabled"]))
+        await callback.message.edit_text(text, reply_markup=autoresponder_keyboard(data["enabled"]))
     except Exception:
         pass
+
 
 @dp.callback_query(F.data == "ar_change")
 async def ar_change(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.set_state(AutoResponderState.waiting_text)
-    await callback.message.answer("✏️ <b>Введите новый текст автоответчика:</b>")
+    await callback.message.answer("✏️ <b>Напиши новый текст автоответчика:</b>")
+
 
 @dp.message(AutoResponderState.waiting_text)
 async def ar_save_text(message: Message, state: FSMContext):
@@ -339,19 +378,23 @@ async def ar_save_text(message: Message, state: FSMContext):
         return
 
     chat_id = message.chat.id
-    await update_chat_setting(chat_id, ar_enabled=True, ar_text=text)
+    autoresponders[chat_id] = {"enabled": True, "text": text}
     await state.clear()
     await message.answer(
         f"✅ <b>Автоответчик включён.</b>\n\nТекст:\n<blockquote>{text}</blockquote>",
         reply_markup=autoresponder_keyboard(True)
     )
 
+
 @dp.callback_query(F.data == "ar_enable")
 async def ar_enable(callback: CallbackQuery):
     await callback.answer("Автоответчик включён")
     chat_id = callback.message.chat.id
-    await update_chat_setting(chat_id, ar_enabled=True)
+    autoresponders.setdefault(chat_id, {})["enabled"] = True
+    if "text" not in autoresponders[chat_id]:
+        autoresponders[chat_id]["text"] = "Я сейчас не могу ответить."
     await panel_autoresponder(callback)
+
 
 @dp.callback_query(F.data == "ar_disable")
 async def ar_disable(callback: CallbackQuery):
@@ -361,20 +404,67 @@ async def ar_disable(callback: CallbackQuery):
     except Exception:
         pass
 
+
 @dp.callback_query(F.data == "ar_disable_yes")
 async def ar_disable_yes(callback: CallbackQuery):
     await callback.answer("Отключено")
     chat_id = callback.message.chat.id
-    await update_chat_setting(chat_id, ar_enabled=False)
+    autoresponders.setdefault(chat_id, {})["enabled"] = False
     await panel_autoresponder(callback)
+
 
 @dp.callback_query(F.data == "ar_disable_no")
 async def ar_disable_no(callback: CallbackQuery):
     await callback.answer()
     await panel_autoresponder(callback)
 
+
+@dp.callback_query(F.data.startswith("rps:"))
+async def rps_choice(callback: CallbackQuery):
+    try:
+        _, choice, chat_id_raw = callback.data.split(":")
+        chat_id = int(chat_id_raw)
+    except Exception:
+        await callback.answer("Ошибка игры", show_alert=True)
+        return
+
+    game = active_games.get(chat_id)
+    if not game:
+        await callback.answer("Игра закончена.", show_alert=True)
+        return
+
+    user_id = callback.from_user.id
+    if user_id in game["choices"]:
+        await callback.answer("Ты уже сделал выбор!", show_alert=True)
+        return
+
+    game["choices"][user_id] = choice
+    await callback.answer(f"Выбрано: {RPS_NAMES[choice]}")
+
+    if len(game["choices"]) == 2:
+        asyncio.create_task(finish_rps(chat_id))
+
+
+@dp.callback_query(F.data.startswith("rps_again:"))
+async def rps_again(callback: CallbackQuery):
+    chat_id = int(callback.data.split(":")[1])
+    await callback.answer()
+    await start_rps(chat_id)
+
+
+@dp.callback_query(F.data.startswith("rps_cancel:"))
+async def rps_cancel(callback: CallbackQuery):
+    chat_id = int(callback.data.split(":")[1])
+    await callback.answer("Игра завершена")
+    active_games.pop(chat_id, None)
+    try:
+        await callback.message.edit_text("❌ <b>Игра отменена.</b>")
+    except Exception:
+        pass
+
+
 # ============================================================
-# ОБРАБОТКА ВСЕХ СООБЩЕНИЙ
+# ХЭНДЛЕРЫ СООБЩЕНИЙ
 # ============================================================
 
 @dp.message(F.chat.type == "private")
@@ -385,6 +475,7 @@ async def private_message_handler(message: Message):
     is_owner = (OWNER_ID != 0 and message.from_user.id == OWNER_ID) or (OWNER_ID == 0)
     await process_command_or_autorespond(message, is_owner=is_owner)
 
+
 @dp.business_message()
 async def business_message_handler(message: Message):
     connection_id = message.business_connection_id
@@ -392,31 +483,34 @@ async def business_message_handler(message: Message):
         return
 
     connection = await get_connection_info(connection_id)
-    if not connection:
+    if not connection or message.sender_business_bot:
         return
 
     owner_id = connection.user.id
     sender_id = message.from_user.id if message.from_user else None
-
-    if message.sender_business_bot:
-        return
-
     is_owner = (sender_id == owner_id)
+
     await process_command_or_autorespond(message, is_owner=is_owner, connection_id=connection_id)
 
+
+@dp.errors()
+async def errors_handler(event):
+    logging.exception("Ошибка обработки Telegram события: %s", event.exception)
+
+
 # ============================================================
-# ЗАПУСК И СБРОС ВЕБХУКОВ
+# ЗАПУСК
 # ============================================================
 
 async def main():
-    logging.info("Инициализация базы данных...")
-    await init_db()
+    logging.info("======================================")
+    logging.info("      SHADOW BUSINESS BOT START")
+    logging.info("======================================")
 
-    logging.info("Очистка Webhook и старых подключений...")
     await bot.delete_webhook(drop_pending_updates=True)
 
     me = await bot.get_me()
-    logging.info("Бот успешно запущен: @%s | ID: %s", me.username, me.id)
+    logging.info("Бот запущен: @%s | id=%s", me.username, me.id)
 
     await dp.start_polling(
         bot,
@@ -428,6 +522,7 @@ async def main():
             "business_connection"
         ]
     )
+
 
 if __name__ == "__main__":
     try:
