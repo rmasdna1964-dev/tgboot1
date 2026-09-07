@@ -27,22 +27,6 @@ BOT_TOKEN = os.getenv("8955553619:AAHqVdxHL8l_8VnhbjEwp8Nr3Sp6ddquX-E", "").stri
 SUPABASE_URL = os.getenv("https://uzdorwhlwihwhvnedwkj.supabase.co", "").strip()
 SUPABASE_KEY = os.getenv("sb_publishable_GvTORvdPKyFzSp3Kjlx2HA_9OBY9xx-", "").strip()
 
-if not BOT_TOKEN:
-    raise RuntimeError(
-        "BOT_TOKEN не найден. Добавь BOT_TOKEN в Secrets/Environment Variables."
-    )
-
-if not SUPABASE_URL:
-    raise RuntimeError(
-        "SUPABASE_URL не найден. Добавь SUPABASE_URL в Secrets/Environment Variables."
-    )
-
-if not SUPABASE_KEY:
-    raise RuntimeError(
-        "SUPABASE_KEY не найден. Добавь SUPABASE_KEY в Secrets/Environment Variables."
-    )
-
-
 # ============================================================
 # ИНИЦИАЛИЗАЦИЯ
 # ============================================================
