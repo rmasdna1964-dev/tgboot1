@@ -21,10 +21,12 @@ from supabase import create_client, Client
 # НАСТРОЙКИ
 # ============================================================
 
-BOT_TOKEN = os.environ["8955553619:AAGzE7GRAMuccvNEb2DqDgkdvISz4_Tp7zA"]
+# Проверяем переменную окружения; если её нет — берем токен по умолчанию
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8955553619:AAGzE7GRAMuccvNEb2DqDgkdvISz4_Tp7zA")
 
 SUPABASE_URL = "https://uzdorwhlwihwhvnedwkj.supabase.co"
 SUPABASE_KEY = "sb_publishable_GvTORvdPKyFzSp3Kjlx2HA_9OBY9xx-"
+
 
 # ============================================================
 # ИНИЦИАЛИЗАЦИЯ
@@ -447,8 +449,8 @@ async def start_rps_game(
         chat_id=chat_id,
         text=(
             "🎮 **КАМЕНЬ • НОЖНИЦЫ • БУМАГА**\n\n"
-            "👥 Игроков готово: **0/2**\n\n"
-            "Каждый игрок должен выбрать свой вариант:"
+            "👥 Игроков готово: **(0/2)**\n\n"
+            "Сделайте свой выбор ниже:"
         ),
         reply_markup=get_rps_keyboard(chat_id),
         business_connection_id=business_connection_id,
@@ -514,10 +516,7 @@ async def finish_rps_game(
 
     await bot.send_message(
         chat_id=chat_id,
-        text="⏳ **Все игроки готовы!**\n\n"
-             "3️⃣\n"
-             "2️⃣\n"
-             "1️⃣",
+        text="⏳ **Все игроки готовы!** Подсчитываем результат (2 сек)...",
         business_connection_id=game["business_connection_id"],
         parse_mode="Markdown"
     )
@@ -545,11 +544,8 @@ async def finish_rps_game(
     text = (
         "🎮 **РЕЗУЛЬТАТ ИГРЫ**\n\n"
 
-        f"👤 {player1['name']}\n"
-        f"   {CHOICE_NAMES[c1]}\n\n"
-
-        f"👤 {player2['name']}\n"
-        f"   {CHOICE_NAMES[c2]}\n\n"
+        f"👤 {player1['name']}: {CHOICE_NAMES[c1]}\n"
+        f"👤 {player2['name']}: {CHOICE_NAMES[c2]}\n\n"
 
         f"{result}"
     )
@@ -581,6 +577,9 @@ async def process_rps_choice(
         return
 
     choice = parts[1]
+
+    if choice in ["restart", "cancel"]:
+        return
 
     try:
         chat_id = int(parts[2])
@@ -643,7 +642,7 @@ async def process_rps_choice(
     count = len(game["choices"])
 
     await callback.answer(
-        f"Ты выбрал: {CHOICE_NAMES[choice]}"
+        f"Твой выбор: {CHOICE_NAMES[choice]}"
     )
 
     # Первый игрок
@@ -652,9 +651,12 @@ async def process_rps_choice(
         await bot.send_message(
             chat_id=chat_id,
             text=(
-                "✅ **1/2 игроков готовы!**\n\n"
-                "⏳ Ждём второго игрока..."
+                f"🎮 **Дуэль: Камень, ножницы, бумага!**\n\n"
+                f"Игрок **{user_name}** сделал ход!\n"
+                f"Статус: **(1/2 игроков готово)**\n"
+                f"Ожидаем второго игрока..."
             ),
+            reply_markup=get_rps_keyboard(chat_id),
             business_connection_id=game[
                 "business_connection_id"
             ],
@@ -669,8 +671,8 @@ async def process_rps_choice(
         await bot.send_message(
             chat_id=chat_id,
             text=(
-                "✅ **2/2 игроков готовы!**\n\n"
-                "⏳ Начинаем игру..."
+                "✅ **(2/2 игроков готово!)**\n\n"
+                "Подводим итоги..."
             ),
             business_connection_id=game[
                 "business_connection_id"
@@ -726,7 +728,7 @@ async def restart_rps(
         chat_id=chat_id,
         text=(
             "🎮 **НОВАЯ ИГРА!**\n\n"
-            "👥 Игроков готово: **0/2**\n\n"
+            "👥 Игроков готово: **(0/2)**\n\n"
             "Выберите вариант:"
         ),
         reply_markup=get_rps_keyboard(chat_id),
@@ -735,7 +737,7 @@ async def restart_rps(
     )
 
     await callback.answer(
-        "Новая игра!"
+        "Новая игра создана!"
     )
 
 
@@ -761,8 +763,8 @@ async def cancel_rps(
     if chat_id in active_games:
         del active_games[chat_id]
 
-    await callback.message.answer(
-        "❌ **Игра завершена.**",
+    await callback.message.edit_text(
+        "❌ **Игра отменена.**",
         parse_mode="Markdown"
     )
 
@@ -870,29 +872,25 @@ async def handle_business_message(
 
         if text == ".info":
 
-            user = message.from_user
+            chat = await bot.get_chat(chat_id)
 
             username = (
-                f"@{user.username}"
-                if user.username
+                f"@{chat.username}"
+                if chat.username
                 else "отсутствует"
             )
 
-            full_name = (
-                user.full_name
-                if hasattr(user, "full_name")
-                else user.first_name
-            )
+            first_name = chat.first_name or "Не указано"
+            last_name = chat.last_name or ""
+            full_name = f"{first_name} {last_name}".strip()
 
             info_text = (
                 "👤 **ИНФОРМАЦИЯ О СОБЕСЕДНИКЕ**\n\n"
 
                 f"📝 Имя: **{full_name}**\n"
-                f"🆔 ID: `{user.id}`\n"
+                f"🆔 ID: `{chat.id}`\n"
                 f"🔗 Username: {username}\n"
-                f"🌐 Язык: `{user.language_code or 'не указан'}`\n"
-                f"🤖 Бот: "
-                f"{'да' if user.is_bot else 'нет'}"
+                f"💬 Тип чата: `{chat.type}`"
             )
 
             await bot.send_message(
@@ -1096,7 +1094,7 @@ async def handle_business_message(
     if is_partner:
 
         # ----------------------------------------------------
-        # АВТООТВЕТЧИК
+        # АВТООТВЕТЧИК И СПАМ
         # ----------------------------------------------------
 
         if (
@@ -1111,14 +1109,7 @@ async def handle_business_message(
                     business_connection_id
             )
 
-            # НЕ return, если хотим чтобы .spam
-            # тоже мог работать отдельно
-
-        # ----------------------------------------------------
-        # .spam
-        # ----------------------------------------------------
-
-        if spam_text:
+        elif spam_text:
 
             await bot.send_message(
                 chat_id=chat_id,
