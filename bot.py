@@ -164,6 +164,14 @@ async def handle_business_message(message: Message):
     
     chat_id = message.chat.id
     text = (message.text or "").strip()
+    
+    # Динамически получаем ID и имя человека, отправившего сообщение
+    sender_id = message.from_user.id
+    sender_name = message.from_user.first_name
+    conn_id = message.business_connection_id
+
+    # Логируем ID отправителя в консоль
+    logging.info(f"Сообщение от пользователя: {sender_name} (ID: {sender_id}) | Чат: {chat_id}")
 
     # 1. AFK Управление
     if text.startswith(".afk"):
@@ -173,7 +181,7 @@ async def handle_business_message(message: Message):
         await bot.send_message(
             chat_id=chat_id,
             text=f"💤 **Режим AFK включен.**\nПричина: {reason}",
-            business_connection_id=message.business_connection_id,
+            business_connection_id=conn_id,
             parse_mode="Markdown"
         )
         return
@@ -183,7 +191,7 @@ async def handle_business_message(message: Message):
         await bot.send_message(
             chat_id=chat_id,
             text="☀️ **Режим AFK выключен.**",
-            business_connection_id=message.business_connection_id,
+            business_connection_id=conn_id,
             parse_mode="Markdown"
         )
         return
@@ -193,7 +201,7 @@ async def handle_business_message(message: Message):
         await bot.send_message(
             chat_id=chat_id,
             text=f"💤 **Владелец сейчас AFK.**\nПричина: {afk_status['reason']}",
-            business_connection_id=message.business_connection_id,
+            business_connection_id=conn_id,
             parse_mode="Markdown"
         )
         return
@@ -203,7 +211,7 @@ async def handle_business_message(message: Message):
         await bot.send_message(
             chat_id=chat_id,
             text=random.choice(TROLL_PHRASES),
-            business_connection_id=message.business_connection_id
+            business_connection_id=conn_id
         )
         return
 
@@ -220,7 +228,7 @@ async def handle_business_message(message: Message):
                         chat_id=chat_id,
                         photo=cat_url,
                         caption="🐱 Вот твой случайный котик!",
-                        business_connection_id=message.business_connection_id
+                        business_connection_id=conn_id
                     )
         return
 
@@ -235,7 +243,7 @@ async def handle_business_message(message: Message):
             await bot.send_message(
                 chat_id=chat_id,
                 text=f"{val} - 7 = {val - 7}",
-                business_connection_id=message.business_connection_id
+                business_connection_id=conn_id
             )
             val -= 7
             await asyncio.sleep(0.3)
@@ -246,7 +254,7 @@ async def handle_business_message(message: Message):
             await bot.send_message(
                 chat_id=chat_id,
                 text="я гуль...",
-                business_connection_id=message.business_connection_id
+                business_connection_id=conn_id
             )
         is_ghouling = False
         return
@@ -257,7 +265,7 @@ async def handle_business_message(message: Message):
         await bot.send_message(
             chat_id=chat_id,
             text="🛑 **Цикл 1000-7 остановлен.**",
-            business_connection_id=message.business_connection_id,
+            business_connection_id=conn_id,
             parse_mode="Markdown"
         )
         return
@@ -275,7 +283,7 @@ async def handle_business_message(message: Message):
         await bot.send_message(
             chat_id=chat_id,
             text=info_msg,
-            business_connection_id=message.business_connection_id,
+            business_connection_id=conn_id,
             parse_mode="Markdown"
         )
         return
@@ -287,7 +295,7 @@ async def handle_business_message(message: Message):
         await bot.send_message(
             chat_id=chat_id,
             text=f"Режим авто-троллинга **{status}**",
-            business_connection_id=message.business_connection_id,
+            business_connection_id=conn_id,
             parse_mode="Markdown"
         )
         return
@@ -302,7 +310,7 @@ async def handle_business_message(message: Message):
             chat_id=chat_id,
             text=f"✅ **Вы получили чек на {amount} USDT ($ {amount})**\n\nНажмите кнопку ниже, чтобы забрать средства.",
             reply_markup=check_markup,
-            business_connection_id=message.business_connection_id,
+            business_connection_id=conn_id,
             parse_mode="Markdown"
         )
         return
@@ -315,7 +323,7 @@ async def handle_business_message(message: Message):
             await bot.send_message(
                 chat_id=chat_id,
                 text=f"📌 Заметка **'{args[0]}'** сохранена!",
-                business_connection_id=message.business_connection_id,
+                business_connection_id=conn_id,
                 parse_mode="Markdown"
             )
         return
@@ -326,7 +334,7 @@ async def handle_business_message(message: Message):
         await bot.send_message(
             chat_id=chat_id,
             text=res,
-            business_connection_id=message.business_connection_id,
+            business_connection_id=conn_id,
             parse_mode="Markdown"
         )
         return
@@ -339,7 +347,7 @@ async def handle_business_message(message: Message):
             await bot.send_message(
                 chat_id=chat_id,
                 text=fixed,
-                business_connection_id=message.business_connection_id
+                business_connection_id=conn_id
             )
         return
 
@@ -350,7 +358,7 @@ async def handle_business_message(message: Message):
             chat_id=chat_id,
             text="🎮 **Дуэль: Камень, ножницы, бумага!**",
             reply_markup=get_rps_keyboard(chat_id),
-            business_connection_id=message.business_connection_id,
+            business_connection_id=conn_id,
             parse_mode="Markdown"
         )
         return
@@ -361,7 +369,7 @@ async def handle_business_message(message: Message):
         if msg:
             is_spamming = True
             while is_spamming:
-                await bot.send_message(chat_id=chat_id, text=msg, business_connection_id=message.business_connection_id)
+                await bot.send_message(chat_id=chat_id, text=msg, business_connection_id=conn_id)
                 await asyncio.sleep(0)
 
     elif text.startswith(".spam"):
@@ -369,7 +377,7 @@ async def handle_business_message(message: Message):
         if msg:
             is_spamming = True
             while is_spamming:
-                await bot.send_message(chat_id=chat_id, text=msg, business_connection_id=message.business_connection_id)
+                await bot.send_message(chat_id=chat_id, text=msg, business_connection_id=conn_id)
                 await asyncio.sleep(1.5)
 
     elif text.startswith(".killerspam"):
@@ -377,12 +385,17 @@ async def handle_business_message(message: Message):
         if msg:
             is_spamming = True
             while is_spamming:
-                await bot.send_message(chat_id=chat_id, text=msg, business_connection_id=message.business_connection_id)
+                await bot.send_message(chat_id=chat_id, text=msg, business_connection_id=conn_id)
                 await asyncio.sleep(0.1)
 
     elif text == ".stop":
         is_spamming = False
-        await bot.send_message(chat_id=chat_id, text="🛑 Спам остановлен.", business_connection_id=message.business_connection_id)
+        await bot.send_message(
+            chat_id=chat_id, 
+            text=f"🛑 Спам остановлен по команде пользователя ID: `{sender_id}`", 
+            business_connection_id=conn_id,
+            parse_mode="Markdown"
+        )
 
 async def main():
     logging.basicConfig(level=logging.INFO)
