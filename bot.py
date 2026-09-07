@@ -14,67 +14,21 @@ BOT_TOKEN = "8955553619:AAGzE7GRAMuccvNEb2DqDgkdvISz4_Tp7zA"
 SUPABASE_URL = "https://uzdorwhlwihwhvnedwkj.supabase.co"
 SUPABASE_KEY = "sb_publishable_GvTORvdPKyFzSp3Kjlx2HA_9OBY9xx-"
 
-# Инициализация Supabase, бота и диспетчера
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# Хранилища состояний
-active_trolls = {}   # chat_id: bool
-autoresponder = {"active": False, "text": "Привет! Сейчас я занят и отвечу позже."}
-is_ghouling = False
+# Состояния и хранилища
+autoresponder = {"active": True, "text": "Привет! Сейчас я занят, отвечу позже."}
+active_trolls = {}
+notes = {}
+active_games = {} # chat_id: {"choices": {user_id: {"choice": str, "name": str}}}
 
-# Состояния FSM для настройки автоответчика
 class AutoresponderState(StatesGroup):
     waiting_for_text = State()
 
-# Хранилище заметок и активных игр
-notes = {}
-active_games = {}
+# --- ВЫСПРАВЛЕННАЯ ЛОГИКА ИГРЫ КНБ ---
 
-# Список фраз для авто-троллинга (.a_troll)
-TROLL_PHRASES = [
-    "Спорить с тобой — это как играть в шахматы с голубем.",
-    "Ты всегда такой умный или сегодня особенный день?",
-    "Ага, очень интересно, продолжай (нет).",
-    "Мнение принято, отправлено в корзину.",
-    "1000-7, гуль, получается?"
-]
-
-# Регистрация / получение пользователя в Supabase
-async def get_or_create_user(user_id: int, username: str):
-    try:
-        response = supabase.table("profiles").select("*").eq("id", user_id).execute()
-        if not response.data:
-            new_user = {"id": user_id, "username": username, "balance": 100}
-            data = supabase.table("profiles").insert(new_user).execute()
-            return data.data[0], True
-        return response.data[0], False
-    except Exception as e:
-        logging.error(f"Ошибка БД: {e}")
-        return None, False
-
-# Главная панель управления
-def get_main_keyboard():
-    ar_btn_text = "🔴 Отключить автоответчик" if autoresponder["active"] else "🟢 Включить автоответчик"
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=ar_btn_text, callback_data="toggle_ar_panel")],
-        [
-            InlineKeyboardButton(text="📖 Инструкция", callback_data="show_help"),
-            InlineKeyboardButton(text="🎮 Игра", callback_data="show_game_info")
-        ]
-    ])
-
-# Клавиатура подтверждения отключения
-def get_confirm_turnoff_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Да, отключить", callback_data="confirm_ar_off"),
-            InlineKeyboardButton(text="❌ Нет, оставить", callback_data="cancel_ar_off")
-        ]
-    ])
-
-# Игра КНБ
 def get_rps_keyboard(chat_id: int):
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -92,135 +46,113 @@ def get_post_game_keyboard(chat_id: int):
         ]
     ])
 
-# --- КОМАНДА /start И ПАНЕЛЬ ---
-
-@dp.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext):
-    await state.clear()
-    user_id = message.from_user.id
-    username = message.from_user.username or "Аноним"
-    await get_or_create_user(user_id, username)
-    
-    status_text = f"Автоответчик для ЛС: **{'ВКЛЮЧЕН 🟢' if autoresponder['active'] else 'ВЫКЛЮЧЕН 🔴'}**"
-    if autoresponder["active"]:
-        status_text += f"\nТекущий текст: _{autoresponder['text']}_"
-
-    text = f"Привет, {username}!\nПанель управления Telegram Business.\n\n{status_text}"
-    await message.answer(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
-
-# Управление автоответчиком через панель
-@dp.callback_query(F.data == "toggle_ar_panel")
-async def process_ar_toggle_click(callback_query: CallbackQuery, state: FSMContext):
-    if not autoresponder["active"]:
-        await state.set_state(AutoresponderState.waiting_for_text)
-        await callback_query.message.answer("⌨️ **Отправьте текст для автоответчика:**\n_(Этот текст будет приходить всем, кто пишет вам в ЛС)_", parse_mode="Markdown")
-        await callback_query.answer()
-    else:
-        await callback_query.message.answer(
-            "⚠️ **Отключить автоответчик для ЛС?**",
-            reply_markup=get_confirm_turnoff_keyboard(),
-            parse_mode="Markdown"
-        )
-        await callback_query.answer()
-
-# Сохранение текста автоответчика
-@dp.message(AutoresponderState.waiting_for_text)
-async def process_ar_text_input(message: Message, state: FSMContext):
-    text = message.text.strip()
-    autoresponder["active"] = True
-    autoresponder["text"] = text
-    await state.clear()
-    
-    await message.answer(
-        f"✅ **Автоответчик включен!**\n\nТекст автоответа:\n_{text}_",
-        reply_markup=get_main_keyboard(),
-        parse_mode="Markdown"
-    )
-
-# Подтверждение отключения
-@dp.callback_query(F.data == "confirm_ar_off")
-async def process_confirm_ar_off(callback_query: CallbackQuery):
-    autoresponder["active"] = False
-    await callback_query.message.edit_text("☀️ **Автоответчик отключен.**", parse_mode="Markdown")
-    await callback_query.answer("Автоответчик выключен!")
-
-# Отмена отключения
-@dp.callback_query(F.data == "cancel_ar_off")
-async def process_cancel_ar_off(callback_query: CallbackQuery):
-    await callback_query.message.edit_text("👍 Автоответчик остался **включенным**.", parse_mode="Markdown")
-    await callback_query.answer()
-
-# --- ИНСТРУКЦИИ И ИГРЫ ---
-
-@dp.callback_query(F.data == "show_help")
-async def process_help_callback(callback_query: CallbackQuery):
-    help_text = (
-        "**Все доступные команды:**\n\n"
-        "⚡ `.ghoul` — Цикл 1000-7 (Dead Inside).\n"
-        "🛑 `.ghoulstop` — Остановить цикл 1000-7.\n"
-        "👤 `.info` — Информация о пользователе.\n"
-        "🎭 `.a_troll` — Включить/выключить авто-троллинг.\n"
-        "📌 `.note [имя] [текст]` / `.get [имя]` — Быстрые шаблоны.\n"
-        "🎮 `.starts` — Игра «Камень, ножницы, бумага»."
-    )
-    await callback_query.message.answer(help_text, parse_mode="Markdown")
-    await callback_query.answer()
-
-@dp.callback_query(F.data == "show_game_info")
-async def process_game_info_callback(callback_query: CallbackQuery):
-    await callback_query.message.answer("🎮 Запустите дуэль командой: `.starts`", parse_mode="Markdown")
-    await callback_query.answer()
-
-# КНБ Handlers
-@dp.callback_query(lambda c: c.data and (c.data.startswith("rps_restart_") or c.data.startswith("rps_cancel_")))
-async def process_post_game_actions(callback_query: CallbackQuery):
+@dp.callback_query(lambda c: c.data and c.data.startswith("rps_"))
+async def process_rps(callback_query: CallbackQuery):
     parts = callback_query.data.split("_")
-    action, chat_id = parts[1], int(parts[2])
+    action = parts[1]
+    chat_id = int(parts[2])
+    user_id = callback_query.from_user.id
+    user_name = callback_query.from_user.first_name
 
     if action == "restart":
         active_games[chat_id] = {"choices": {}}
-        await callback_query.message.edit_text("🎮 **Дуэль: Камень, ножницы, бумага!**", reply_markup=get_rps_keyboard(chat_id))
-    elif action == "cancel":
-        if chat_id in active_games: del active_games[chat_id]
-        try: await callback_query.message.delete()
-        except: await callback_query.message.edit_text("❌ Игра завершена.")
-
-@dp.callback_query(lambda c: c.data and c.data.startswith("rps_"))
-async def process_rps_choice(callback_query: CallbackQuery):
-    parts = callback_query.data.split("_")
-    choice, chat_id = parts[1], int(parts[2])
-    user_id, user_name = callback_query.from_user.id, callback_query.from_user.first_name
-
-    if chat_id not in active_games:
-        await callback_query.answer("Игра не найдена. Напишите .starts", show_alert=True)
+        await callback_query.message.edit_text("🎮 **Дуэль: Камень, ножницы, бумага!**\nЖдем ходов игроков... (0/2)", reply_markup=get_rps_keyboard(chat_id), parse_mode="Markdown")
+        await callback_query.answer()
         return
 
-    game = active_games[chat_id]
-    game["choices"][user_id] = {"choice": choice, "name": user_name}
-    await callback_query.answer(f"Вы выбрали {choice.upper()}!")
+    if action == "cancel":
+        if chat_id in active_games: 
+            del active_games[chat_id]
+        await callback_query.message.edit_text("❌ Игра отменена.")
+        await callback_query.answer()
+        return
 
-    if len(game["choices"]) >= 2:
-        await callback_query.message.edit_text("⏳ Подсчитываем результаты...")
-        await asyncio.sleep(1.5)
+    # Выбор варианта (rock / scissors / paper)
+    choice = action
+    if chat_id not in active_games:
+        active_games[chat_id] = {"choices": {}}
+
+    game = active_games[chat_id]
+    
+    if user_id in game["choices"]:
+        await callback_query.answer("Вы уже сделали свой выбор!", show_alert=True)
+        return
+
+    game["choices"][user_id] = {"choice": choice, "name": user_name}
+    ready_count = len(game["choices"])
+
+    if ready_count == 1:
+        await callback_query.answer("Ваш выбор принят!")
+        await callback_query.message.edit_text(
+            f"🎮 **Дуэль: Камень, ножницы, бумага!**\n\nИгрок **{user_name}** сделал ход!\nГотовность: **(1/2 игроков)**",
+            reply_markup=get_rps_keyboard(chat_id),
+            parse_mode="Markdown"
+        )
+    elif ready_count >= 2:
+        await callback_query.answer("Ваш выбор принят!")
+        await callback_query.message.edit_text("⏳ Все игроки готовы! Подсчитываем результаты (2 сек)...")
+        await asyncio.sleep(2)
+
         players = list(game["choices"].values())
         p1, p2 = players[0], players[1]
         c1, c2 = p1["choice"], p2["choice"]
 
-        if c1 == c2: result = "🤝 **Ничья!**"
-        elif (c1=="rock" and c2=="scissors") or (c1=="scissors" and c2=="paper") or (c1=="paper" and c2=="rock"):
+        moves = {"rock": "🗿 Камень", "scissors": "✂️ Ножницы", "paper": "📄 Бумага"}
+
+        if c1 == c2:
+            result = "🤝 **Ничья!**"
+        elif (c1 == "rock" and c2 == "scissors") or (c1 == "scissors" and c2 == "paper") or (c1 == "paper" and c2 == "rock"):
             result = f"🏆 Победил **{p1['name']}**!"
         else:
             result = f"🏆 Победил **{p2['name']}**!"
 
-        res_text = f"🎮 **Результаты:**\n👤 **{p1['name']}**: {c1}\n👤 **{p2['name']}**: {c2}\n\n{result}"
+        res_text = (
+            f"🎮 **Результаты дуэли:**\n\n"
+            f"👤 **{p1['name']}**: {moves[c1]}\n"
+            f"👤 **{p2['name']}**: {moves[c2]}\n\n"
+            f"{result}"
+        )
         await callback_query.message.edit_text(res_text, reply_markup=get_post_game_keyboard(chat_id), parse_mode="Markdown")
 
-# --- ОБРАБОТЧИК TELEGRAM BUSINESS ---
+# --- УПРАВЛЕНИЕ БОТОМ В ЛС И TELEGRAM BUSINESS ---
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    status_text = f"Автоответчик: **{'ВКЛЮЧЕН 🟢' if autoresponder['active'] else 'ВЫКЛЮЧЕН 🔴'}**"
+    if autoresponder["active"]:
+        status_text += f"\nТекст: _{autoresponder['text']}_"
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚙️ Изменить автоответчик", callback_data="change_ar")],
+        [InlineKeyboardButton(text="🔴 Переключить автоответчик", callback_data="toggle_ar")]
+    ])
+    await message.answer(f"Панель управления Telegram Business:\n\n{status_text}", reply_markup=kb, parse_mode="Markdown")
+
+@dp.callback_query(F.data == "toggle_ar")
+async def toggle_ar_callback(cq: CallbackQuery):
+    autoresponder["active"] = not autoresponder["active"]
+    status = "включен 🟢" if autoresponder["active"] else "выключен 🔴"
+    await cq.message.answer(f"Автоответчик {status}")
+    await cq.answer()
+
+@dp.callback_query(F.data == "change_ar")
+async def change_ar_callback(cq: CallbackQuery, state: FSMContext):
+    await state.set_state(AutoresponderState.waiting_for_text)
+    await cq.message.answer("Напишите новый текст для автоответчика:")
+    await cq.answer()
+
+@dp.message(AutoresponderState.waiting_for_text)
+async def process_ar_text(message: Message, state: FSMContext):
+    autoresponder["text"] = message.text.strip()
+    autoresponder["active"] = True
+    await state.clear()
+    await message.answer(f"✅ Новый текст автоответчика сохранен и включен:\n_{autoresponder['text']}_", parse_mode="Markdown")
+
+# --- ОБРАБОТЧИК СООБЩЕНИЙ TELEGRAM BUSINESS ---
 
 @dp.business_message()
 async def handle_business_message(message: Message):
-    global active_trolls, is_ghouling, active_games, autoresponder, notes
-    
     chat_id = message.chat.id
     user_id = message.from_user.id
     text = (message.text or "").strip()
@@ -232,126 +164,46 @@ async def handle_business_message(message: Message):
     is_me = (user_id != chat_id)
     is_partner = not is_me
 
-    # =============================================================
-    # 1. КОМАНДЫ ВЛАДЕЛЬЦА
-    # =============================================================
-    if is_me:
-        if text.startswith("."):
-            if text == ".ghoulstop":
-                is_ghouling = False
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text="🛑 **Цикл 1000-7 остановлен.**",
-                    business_connection_id=conn_id,
-                    parse_mode="Markdown"
-                )
-                return
+    # Команды, которые вы вводите в любом чате
+    if is_me and text.startswith("."):
+        if text == ".info":
+            user = message.from_user
+            info_msg = (
+                f"👤 **Информация об аккаунте:**\n\n"
+                f"• **Имя:** {user.first_name} {user.last_name or ''}\n"
+                f"• **ID:** `{user.id}`\n"
+                f"• **Username:** @{user.username if user.username else 'нет'}\n"
+                f"• **Premium:** {'Да ⭐' if user.is_premium else 'Нет'}\n"
+                f"• **Язык:** {user.language_code or 'неизвестно'}"
+            )
+            await bot.send_message(chat_id=chat_id, text=info_msg, business_connection_id=conn_id, parse_mode="Markdown")
 
-            elif text == ".ghoul":
-                if is_ghouling: return
-                is_ghouling = True
-                val = 1000
-                while val > 0 and is_ghouling:
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text=f"{val} - 7 = {val - 7}",
-                        business_connection_id=conn_id
-                    )
-                    val -= 7
-                    await asyncio.sleep(0.3)
-                    if val < 7: break
-                if is_ghouling:
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text="я гуль...",
-                        business_connection_id=conn_id
-                    )
-                is_ghouling = False
-                return
+        elif text == ".starts":
+            active_games[chat_id] = {"choices": {}}
+            await bot.send_message(
+                chat_id=chat_id,
+                text="🎮 **Дуэль: Камень, ножницы, бумага!**\nСделайте свой ход (0/2):",
+                reply_markup=get_rps_keyboard(chat_id),
+                business_connection_id=conn_id,
+                parse_mode="Markdown"
+            )
 
-            elif text == ".info":
-                user = message.from_user
-                info_msg = (
-                    f"👤 **Информация о пользователе:**\n\n"
-                    f"• **Имя:** {user.first_name}\n"
-                    f"• **ID:** `{user.id}`\n"
-                    f"• **Username:** @{user.username if user.username else 'отсутствует'}"
-                )
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=info_msg,
-                    business_connection_id=conn_id,
-                    parse_mode="Markdown"
-                )
-                return
+        elif text.startswith(".note"):
+            args = text[5:].strip().split(maxsplit=1)
+            if len(args) == 2:
+                notes[args[0].lower()] = args[1]
+                await bot.send_message(chat_id=chat_id, text=f"📌 Заметка **'{args[0]}'** сохранена!", business_connection_id=conn_id, parse_mode="Markdown")
 
-            elif text == ".a_troll":
-                current_status = active_trolls.get(chat_id, False)
-                active_trolls[chat_id] = not current_status
-                status = "включен 🎭" if active_trolls[chat_id] else "выключен 🛑"
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=f"Режим авто-троллинга **{status}**",
-                    business_connection_id=conn_id,
-                    parse_mode="Markdown"
-                )
-                return
+        elif text.startswith(".get"):
+            note_name = text[4:].strip().lower()
+            res = notes.get(note_name, f"❌ Заметка '{note_name}' не найдена.")
+            await bot.send_message(chat_id=chat_id, text=res, business_connection_id=conn_id)
 
-            elif text.startswith(".note"):
-                args = text[5:].strip().split(maxsplit=1)
-                if len(args) == 2:
-                    notes[args[0].lower()] = args[1]
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text=f"📌 Заметка **'{args[0]}'** сохранена!",
-                        business_connection_id=conn_id,
-                        parse_mode="Markdown"
-                    )
-                return
-
-            elif text.startswith(".get"):
-                note_name = text[4:].strip().lower()
-                res = notes.get(note_name, f"❌ Заметка **'{note_name}'** не найдена.")
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=res,
-                    business_connection_id=conn_id,
-                    parse_mode="Markdown"
-                )
-                return
-
-            elif text == ".starts":
-                active_games[chat_id] = {"choices": {}}
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text="🎮 **Дуэль: Камень, ножницы, бумага!**",
-                    reply_markup=get_rps_keyboard(chat_id),
-                    business_connection_id=conn_id,
-                    parse_mode="Markdown"
-                )
-                return
-
-    # =============================================================
-    # 2. РЕАКЦИЯ НА ВХОДЯЩИЕ СООБЩЕНИЯ (ОТ СОБЕСЕДНИКА)
-    # =============================================================
+    # Реакция на входящие сообщения собеседника
     if is_partner:
-        # Автоответчик для всех входящих в ЛС
+        # Работа автоответчика в ЛС
         if autoresponder["active"] and message.chat.type == "private":
-            await bot.send_message(
-                chat_id=chat_id,
-                text=autoresponder["text"],
-                business_connection_id=conn_id
-            )
-            return
-
-        # Авто-троллинг
-        if active_trolls.get(chat_id, False):
-            await bot.send_message(
-                chat_id=chat_id,
-                text=random.choice(TROLL_PHRASES),
-                business_connection_id=conn_id
-            )
-            return
+            await bot.send_message(chat_id=chat_id, text=autoresponder["text"], business_connection_id=conn_id)
 
 async def main():
     logging.basicConfig(level=logging.INFO)
