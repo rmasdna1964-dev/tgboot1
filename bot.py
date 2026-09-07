@@ -2,7 +2,8 @@ import asyncio
 import logging
 import os
 import random
-from typing import Dict, Any, Optional
+import aiosqlite
+from typing import Optional, Dict, Any
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
@@ -17,15 +18,17 @@ from aiogram.types import (
 from aiogram.client.default import DefaultBotProperties
 
 # ============================================================
-# НАСТРОЙКИ
+# НАСТРОЙКИ И ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+# Укажи свой Telegram ID для доступа к администрированию через ЛС
+OWNER_ID = int(os.getenv("OWNER_ID", "0").strip() or 0)
 
 if not BOT_TOKEN:
-    raise RuntimeError(
-        "BOT_TOKEN не найден. Добавь BOT_TOKEN в Secrets/Environment Variables."
-    )
+    raise RuntimeError("BOT_TOKEN не найден. Добавь BOT_TOKEN в переменные окружения.")
+
+DB_PATH = "bot_database.db"
 
 # ============================================================
 # ИНИЦИАЛИЗАЦИЯ
@@ -40,38 +43,86 @@ bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(parse_mode="HTML")
 )
-
 dp = Dispatcher()
 
-# ============================================================
-# ПАМЯТЬ БОТА
-# ============================================================
-
-business_owners: Dict[str, int] = {}
+# Кеш для Business Connections в оперативной памяти
 business_connections: Dict[str, Any] = {}
-autoresponders: Dict[int, Dict[str, Any]] = {}
-active_games: Dict[int, Dict[str, Any]] = {}
-active_trolls: Dict[int, bool] = {}
-is_ghouling: Dict[int, bool] = {}
-notes: Dict[int, list] = {}
 
 # ============================================================
-# FSM
+# РАБОТА С БАЗОЙ ДАННЫХ (SQLite)
+# ============================================================
+
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Таблица настроек чата (автоответчик, режими ghoul/troll)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS chat_settings (
+                chat_id INTEGER PRIMARY KEY,
+                ar_enabled INTEGER DEFAULT 0,
+                ar_text TEXT DEFAULT 'Я сейчас не могу ответить.',
+                is_ghoul INTEGER DEFAULT 0,
+                is_troll INTEGER DEFAULT 0
+            )
+        """)
+        # Таблица заметок
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER,
+                text TEXT
+            )
+        """)
+        await db.commit()
+
+async def get_chat_settings(chat_id: int) -> dict:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT ar_enabled, ar_text, is_ghoul, is_troll FROM chat_settings WHERE chat_id = ?",
+            (chat_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return {"ar_enabled": bool(row[0]), "ar_text": row[1], "is_ghoul": bool(row[2]), "is_troll": bool(row[3])}
+            return {"ar_enabled": False, "ar_text": "Я сейчас не могу ответить.", "is_ghoul": False, "is_troll": False}
+
+async def update_chat_setting(chat_id: int, **kwargs):
+    current = await get_chat_settings(chat_id)
+    current.update(kwargs)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO chat_settings (chat_id, ar_enabled, ar_text, is_ghoul, is_troll)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                ar_enabled=excluded.ar_enabled,
+                ar_text=excluded.ar_text,
+                is_ghoul=excluded.is_ghoul,
+                is_troll=excluded.is_troll
+        """, (chat_id, int(current["ar_enabled"]), current["ar_text"], int(current["is_ghoul"]), int(current["is_troll"])))
+        await db.commit()
+
+async def add_note(chat_id: int, text: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO notes (chat_id, text) VALUES (?, ?)", (chat_id, text))
+        await db.commit()
+
+async def get_notes(chat_id: int) -> list:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT text FROM notes WHERE chat_id = ?", (chat_id,)) as cursor:
+            rows = await cursor.fetchall()
+            return [r[0] for r in rows]
+
+# ============================================================
+# FSM И КЛАВИАТУРЫ
 # ============================================================
 
 class AutoResponderState(StatesGroup):
     waiting_text = State()
 
-# ============================================================
-# КЛАВИАТУРЫ
-# ============================================================
-
 def main_panel() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🤖 Автоответчик", callback_data="panel_autoresponder")],
-            [InlineKeyboardButton(text="🎮 Камень-ножницы-бумага", callback_data="panel_rps")],
-            [InlineKeyboardButton(text="ℹ️ Помощь", callback_data="panel_help")],
+            [InlineKeyboardButton(text="ℹ️ Помощь по командам", callback_data="panel_help")],
         ]
     )
 
@@ -96,25 +147,8 @@ def disable_confirm_keyboard() -> InlineKeyboardMarkup:
         ]
     )
 
-def rps_keyboard(chat_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🪨 Камень", callback_data=f"rps:rock:{chat_id}")],
-            [InlineKeyboardButton(text="✂️ Ножницы", callback_data=f"rps:scissors:{chat_id}")],
-            [InlineKeyboardButton(text="📄 Бумага", callback_data=f"rps:paper:{chat_id}")],
-        ]
-    )
-
-def rps_after_keyboard(chat_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🎮 Играть ещё", callback_data=f"rps_again:{chat_id}")],
-            [InlineKeyboardButton(text="❌ Отказаться", callback_data=f"rps_cancel:{chat_id}")]
-        ]
-    )
-
 # ============================================================
-# BUSINESS CONNECTION & SEND
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ============================================================
 
 async def get_connection_info(connection_id: str):
@@ -126,13 +160,12 @@ async def get_connection_info(connection_id: str):
     try:
         connection = await bot.get_business_connection(business_connection_id=connection_id)
         business_connections[connection_id] = connection
-        business_owners[connection_id] = connection.user.id
         return connection
     except Exception:
         logging.exception("Ошибка получения Business Connection")
         return None
 
-async def business_send(
+async def send_reply(
     chat_id: int,
     text: str,
     connection_id: Optional[str] = None,
@@ -147,12 +180,108 @@ async def business_send(
     return await bot.send_message(**kwargs)
 
 # ============================================================
-# START & PANEL HANDLERS
+# ЛОГИКА ОБРАБОТКИ
+# ============================================================
+
+async def process_command_or_autorespond(message: Message, is_owner: bool, connection_id: Optional[str] = None):
+    text = (message.text or "").strip()
+    chat_id = message.chat.id
+    lower = text.lower()
+
+    # 1. КОМАНДЫ УПРАВЛЕНИЯ (Только для владельца)
+    if is_owner and text.startswith("."):
+        if lower.startswith(".spam"):
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2:
+                await send_reply(chat_id, "❌ Укажите текст: <code>.spam текст</code>", connection_id)
+                return True
+            spam_text = parts[1].strip()
+            await update_chat_setting(chat_id, ar_enabled=True, ar_text=spam_text)
+            await send_reply(chat_id, f"✅ <b>Автоответчик включён:</b>\n<blockquote>{spam_text}</blockquote>", connection_id)
+            return True
+
+        if lower == ".info":
+            user = message.from_user
+            username = f"@{user.username}" if user and user.username else "нет"
+            info_text = (
+                f"ℹ️ <b>Инфо о собеседнике</b>\n\n"
+                f"👤 Имя: <b>{user.full_name if user else 'Неизвестно'}</b>\n"
+                f"🆔 ID: <code>{user.id if user else 'N/A'}</code>\n"
+                f"🔗 Username: {username}\n"
+                f"💬 Chat ID: <code>{chat_id}</code>"
+            )
+            await send_reply(chat_id, info_text, connection_id)
+            return True
+
+        if lower == ".ghoul":
+            await update_chat_setting(chat_id, is_ghoul=True)
+            await send_reply(chat_id, "👻 <b>Режим Ghoul включён.</b>", connection_id)
+            return True
+
+        if lower == ".ghoulstop":
+            await update_chat_setting(chat_id, is_ghoul=False)
+            await send_reply(chat_id, "👻 <b>Режим Ghoul выключен.</b>", connection_id)
+            return True
+
+        if lower == ".a_troll":
+            settings = await get_chat_settings(chat_id)
+            new_troll_state = not settings["is_troll"]
+            await update_chat_setting(chat_id, is_troll=new_troll_state)
+            status_str = "включён" if new_troll_state else "выключен"
+            await send_reply(chat_id, f"😈 <b>Режим Troll {status_str}.</b>", connection_id)
+            return True
+
+        if lower.startswith(".note"):
+            parts = text.split(maxsplit=1)
+            if len(parts) >= 2:
+                await add_note(chat_id, parts[1].strip())
+                await send_reply(chat_id, "📝 <b>Заметка сохранена.</b>", connection_id)
+            return True
+
+        if lower == ".get":
+            user_notes = await get_notes(chat_id)
+            out = "📝 Заметок нет." if not user_notes else "📝 <b>Заметки:</b>\n\n" + "\n".join(f"{i+1}. {n}" for i, n in enumerate(user_notes))
+            await send_reply(chat_id, out, connection_id)
+            return True
+
+    # 2. АВТООТВЕТЫ И СПЕЦРЕЖИМЫ (На сообщения собеседника)
+    if not is_owner:
+        settings = await get_chat_settings(chat_id)
+
+        if settings["ar_enabled"] and settings["ar_text"]:
+            try:
+                await send_reply(chat_id, settings["ar_text"], connection_id)
+            except Exception:
+                pass
+            return True
+
+        if settings["is_ghoul"]:
+            try:
+                await send_reply(chat_id, "👻 Ты написал в пустоту...", connection_id)
+            except Exception:
+                pass
+            return True
+
+        if settings["is_troll"]:
+            troll_msgs = ["😈 Я всё вижу.", "👀 Интересно...", "🤨 Ты точно хотел это написать?", "🗿 Понял."]
+            try:
+                await send_reply(chat_id, random.choice(troll_msgs), connection_id)
+            except Exception:
+                pass
+            return True
+
+    return False
+
+# ============================================================
+# ХЭНДЛЕРЫ МЕНЮ И ПАНЕЛИ УПРАВЛЕНИЯ
 # ============================================================
 
 @dp.message(CommandStart())
 async def start_command(message: Message):
-    await message.answer("👻 <b>Теневой бот</b>\n\nПанель управления:", reply_markup=main_panel())
+    if OWNER_ID != 0 and message.from_user.id != OWNER_ID:
+        await message.answer("🔒 Доступ ограничен.")
+        return
+    await message.answer("👻 <b>Панель управления ботом</b>", reply_markup=main_panel())
 
 @dp.callback_query(F.data == "back_main")
 async def back_main(callback: CallbackQuery):
@@ -167,14 +296,13 @@ async def panel_help(callback: CallbackQuery):
     await callback.answer()
     text = (
         "ℹ️ <b>Команды управления в чатах:</b>\n\n"
-        "<code>.spam текст</code> — установить текст автоответчика\n"
+        "<code>.spam текст</code> — включить автоответчик с текстом\n"
         "<code>.info</code> — информация о собеседнике\n"
-        "<code>.starts</code> — начать КНБ\n"
-        "<code>.ghoul</code> — режим Ghoul\n"
-        "<code>.ghoulstop</code> — выключить Ghoul\n"
-        "<code>.a_troll</code> — режим Troll\n"
-        "<code>.note текст</code> — сохранить заметку\n"
-        "<code>.get</code> — показать заметки"
+        "<code>.ghoul</code> — включить режим Ghoul\n"
+        "<code>.ghoulstop</code> — выключить режим Ghoul\n"
+        "<code>.a_troll</code> — переключить режим Troll\n"
+        "<code>.note текст</code> — сохранить заметку в чате\n"
+        "<code>.get</code> — показать заметки чата"
     )
     try:
         await callback.message.edit_text(
@@ -184,20 +312,16 @@ async def panel_help(callback: CallbackQuery):
     except Exception:
         pass
 
-# ============================================================
-# АВТООТВЕТЧИК HANDLERS
-# ============================================================
-
 @dp.callback_query(F.data == "panel_autoresponder")
 async def panel_autoresponder(callback: CallbackQuery):
     await callback.answer()
     chat_id = callback.message.chat.id
-    data = autoresponders.get(chat_id, {"enabled": False, "text": "Я сейчас не могу ответить."})
-    status = "🟢 ВКЛЮЧЕН" if data["enabled"] else "🔴 ВЫКЛЮЧЕН"
+    settings = await get_chat_settings(chat_id)
+    status = "🟢 ВКЛЮЧЕН" if settings["ar_enabled"] else "🔴 ВЫКЛЮЧЕН"
     
-    text = f"🤖 <b>Автоответчик</b>\n\nСтатус: <b>{status}</b>\n\nТекст:\n<blockquote>{data['text']}</blockquote>"
+    text = f"🤖 <b>Автоответчик</b>\n\nСтатус: <b>{status}</b>\n\nТекст:\n<blockquote>{settings['ar_text']}</blockquote>"
     try:
-        await callback.message.edit_text(text, reply_markup=autoresponder_keyboard(data["enabled"]))
+        await callback.message.edit_text(text, reply_markup=autoresponder_keyboard(settings["ar_enabled"]))
     except Exception:
         pass
 
@@ -205,7 +329,7 @@ async def panel_autoresponder(callback: CallbackQuery):
 async def ar_change(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.set_state(AutoResponderState.waiting_text)
-    await callback.message.answer("✏️ <b>Напиши новый текст автоответчика:</b>")
+    await callback.message.answer("✏️ <b>Введите новый текст автоответчика:</b>")
 
 @dp.message(AutoResponderState.waiting_text)
 async def ar_save_text(message: Message, state: FSMContext):
@@ -215,7 +339,7 @@ async def ar_save_text(message: Message, state: FSMContext):
         return
 
     chat_id = message.chat.id
-    autoresponders[chat_id] = {"enabled": True, "text": text}
+    await update_chat_setting(chat_id, ar_enabled=True, ar_text=text)
     await state.clear()
     await message.answer(
         f"✅ <b>Автоответчик включён.</b>\n\nТекст:\n<blockquote>{text}</blockquote>",
@@ -226,10 +350,7 @@ async def ar_save_text(message: Message, state: FSMContext):
 async def ar_enable(callback: CallbackQuery):
     await callback.answer("Автоответчик включён")
     chat_id = callback.message.chat.id
-    if chat_id not in autoresponders:
-        autoresponders[chat_id] = {"enabled": True, "text": "Я сейчас не могу ответить."}
-    else:
-        autoresponders[chat_id]["enabled"] = True
+    await update_chat_setting(chat_id, ar_enabled=True)
     await panel_autoresponder(callback)
 
 @dp.callback_query(F.data == "ar_disable")
@@ -244,7 +365,7 @@ async def ar_disable(callback: CallbackQuery):
 async def ar_disable_yes(callback: CallbackQuery):
     await callback.answer("Отключено")
     chat_id = callback.message.chat.id
-    autoresponders.setdefault(chat_id, {})["enabled"] = False
+    await update_chat_setting(chat_id, ar_enabled=False)
     await panel_autoresponder(callback)
 
 @dp.callback_query(F.data == "ar_disable_no")
@@ -253,8 +374,16 @@ async def ar_disable_no(callback: CallbackQuery):
     await panel_autoresponder(callback)
 
 # ============================================================
-# ОБРАБОТКА ВСЕХ БИЗНЕС СООБЩЕНИЙ
+# ОБРАБОТКА ВСЕХ СООБЩЕНИЙ
 # ============================================================
+
+@dp.message(F.chat.type == "private")
+async def private_message_handler(message: Message):
+    if await dp.storage.get_state(bot=bot, key=message.chat.id):
+        return
+
+    is_owner = (OWNER_ID != 0 and message.from_user.id == OWNER_ID) or (OWNER_ID == 0)
+    await process_command_or_autorespond(message, is_owner=is_owner)
 
 @dp.business_message()
 async def business_message_handler(message: Message):
@@ -272,101 +401,22 @@ async def business_message_handler(message: Message):
     if message.sender_business_bot:
         return
 
-    # КОМАНДЫ ОТ ВЛАДЕЛЬЦА АККАУНТА
-    if sender_id == owner_id:
-        text = (message.text or "").strip()
-        if not text:
-            return
-
-        lower = text.lower()
-
-        if lower.startswith(".spam"):
-            parts = text.split(maxsplit=1)
-            if len(parts) < 2:
-                await business_send(message.chat.id, "❌ Укажите текст: <code>.spam текст</code>", connection_id)
-                return
-            spam_text = parts[1].strip()
-            autoresponders[message.chat.id] = {"enabled": True, "text": spam_text}
-            await business_send(message.chat.id, f"✅ <b>Автоответчик включён:</b>\n<blockquote>{spam_text}</blockquote>", connection_id)
-            return
-
-        if lower == ".info":
-            user = message.from_user
-            username = f"@{user.username}" if user and user.username else "нет"
-            info_text = (
-                f"ℹ️ <b>Инфо о собеседнике</b>\n\n"
-                f"👤 Имя: <b>{user.full_name if user else 'Неизвестно'}</b>\n"
-                f"🆔 ID: <code>{user.id if user else 'N/A'}</code>\n"
-                f"🔗 Username: {username}\n"
-                f"💬 Chat ID: <code>{message.chat.id}</code>"
-            )
-            await business_send(message.chat.id, info_text, connection_id)
-            return
-
-        if lower == ".ghoul":
-            is_ghouling[message.chat.id] = True
-            await business_send(message.chat.id, "👻 <b>Ghoul включён.</b>", connection_id)
-            return
-
-        if lower == ".ghoulstop":
-            is_ghouling[message.chat.id] = False
-            await business_send(message.chat.id, "👻 <b>Ghoul выключен.</b>", connection_id)
-            return
-
-        if lower == ".a_troll":
-            active_trolls[message.chat.id] = True
-            await business_send(message.chat.id, "😈 <b>A-Troll включён.</b>", connection_id)
-            return
-
-        if lower.startswith(".note"):
-            parts = text.split(maxsplit=1)
-            if len(parts) >= 2:
-                notes.setdefault(message.chat.id, []).append(parts[1])
-                await business_send(message.chat.id, "📝 <b>Заметка сохранена.</b>", connection_id)
-            return
-
-        if lower == ".get":
-            user_notes = notes.get(message.chat.id, [])
-            out = "📝 Заметок нет." if not user_notes else "📝 <b>Заметки:</b>\n\n" + "\n".join(f"{i+1}. {n}" for i, n in enumerate(user_notes))
-            await business_send(message.chat.id, out, connection_id)
-            return
-
-        return
-
-    # РЕАКЦИЯ НА ВХОДЯЩИЕ СООБЩЕНИЯ СОБЕСЕДНИКА
-    chat_id = message.chat.id
-
-    ar = autoresponders.get(chat_id)
-    if ar and ar.get("enabled") and ar.get("text"):
-        try:
-            await business_send(chat_id, ar["text"], connection_id)
-        except Exception:
-            pass
-        return
-
-    if is_ghouling.get(chat_id):
-        try:
-            await business_send(chat_id, "👻 Ты написал в пустоту...", connection_id)
-        except Exception:
-            pass
-        return
-
-    if active_trolls.get(chat_id):
-        troll_msgs = ["😈 Я всё вижу.", "👀 Интересно...", "🤨 Ты точно хотел это написать?", "🗿 Понял."]
-        try:
-            await business_send(chat_id, random.choice(troll_msgs), connection_id)
-        except Exception:
-            pass
-        return
+    is_owner = (sender_id == owner_id)
+    await process_command_or_autorespond(message, is_owner=is_owner, connection_id=connection_id)
 
 # ============================================================
-# ЗАПУСК
+# ЗАПУСК И СБРОС ВЕБХУКОВ
 # ============================================================
 
 async def main():
-    logging.info("Starting Shadow Business Bot...")
+    logging.info("Инициализация базы данных...")
+    await init_db()
+
+    logging.info("Очистка Webhook и старых подключений...")
+    await bot.delete_webhook(drop_pending_updates=True)
+
     me = await bot.get_me()
-    logging.info("Бот запущен: @%s | id=%s", me.username, me.id)
+    logging.info("Бот успешно запущен: @%s | ID: %s", me.username, me.id)
 
     await dp.start_polling(
         bot,
