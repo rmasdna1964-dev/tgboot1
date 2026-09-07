@@ -22,7 +22,7 @@ from supabase import create_client, Client
 # ============================================================
 
 # Проверяем переменную окружения; если её нет — берем токен по умолчанию
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8955553619:AAGzE7GRAMuccvNEb2DqDgkdvISz4_Tp7zA")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8955553619:AAHp0wVte0cE5-fz9qcf3vG9GEeuB7II8Pc")
 
 SUPABASE_URL = "https://uzdorwhlwihwhvnedwkj.supabase.co"
 SUPABASE_KEY = "sb_publishable_GvTORvdPKyFzSp3Kjlx2HA_9OBY9xx-"
