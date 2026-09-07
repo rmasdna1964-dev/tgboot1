@@ -23,6 +23,10 @@ from supabase import create_client, Client
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8955553619:AAGzE7GRAMuccvNEb2DqDgkdvISz4_Tp7zA")
 
+
+SUPABASE_URL = "https://uzdorwhlwihwhvnedwkj.supabase.co"
+SUPABASE_KEY = "sb_publishable_GvTORvdPKyFzSp3Kjlx2HA_9OBY9xx-"
+
 # ============================================================
 # ИНИЦИАЛИЗАЦИЯ
 # ============================================================
