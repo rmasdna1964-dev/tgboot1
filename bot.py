@@ -8,7 +8,7 @@ from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, C
 from supabase import create_client, Client
 
 # Настройки и ключи
-BOT_TOKEN = "8872260684:AAHEhMfCuLTfG0RK1kjUmDS-TXRiQUWzk"
+BOT_TOKEN = "8872260684:AAED-oo-qBqge-nTot8Kva1H4wxjRZvSHSM"
 SUPABASE_URL = "https://uzdorwhlwihwhvnedwkj.supabase.co"
 SUPABASE_KEY = "sb_publishable_GvTORvdPKyFzSp3Kjlx2HA_9OBY9xx-"
 
