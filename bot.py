@@ -10,10 +10,11 @@ from aiogram.types import (
     Message,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    CallbackQuery
+    CallbackQuery,
+    LabeledPrice,
+    PreCheckoutQuery
 )
 
-# Вставьте ваш НОВЫЙ токен от BotFather
 BOT_TOKEN = "8872260684:AAED-oo-qBqge-nTot8Kva1H4wxjRZvSHSM"
 
 bot = Bot(token=BOT_TOKEN)
@@ -27,7 +28,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
-            balance INTEGER DEFAULT 0,
+            balance INTEGER DEFAULT 1000,
             last_bonus TIMESTAMP
         )
     """)
@@ -40,7 +41,7 @@ def get_user(user_id: int, username: str = "Аноним"):
     cursor.execute("SELECT user_id, balance, last_bonus FROM users WHERE user_id = ?", (user_id,))
     user = cursor.fetchone()
     if not user:
-        cursor.execute("INSERT INTO users (user_id, username, balance) VALUES (?, ?, ?)", (user_id, username, 0))
+        cursor.execute("INSERT INTO users (user_id, username, balance) VALUES (?, ?, ?)", (user_id, username, 1000))
         conn.commit()
         cursor.execute("SELECT user_id, balance, last_bonus FROM users WHERE user_id = ?", (user_id,))
         user = cursor.fetchone()
@@ -54,32 +55,27 @@ def update_balance(user_id: int, amount: int):
     conn.commit()
     conn.close()
 
-def claim_daily_bonus(user_id: int):
-    conn = sqlite3.connect("bot_database.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT last_bonus FROM users WHERE user_id = ?", (user_id,))
-    res = cursor.fetchone()
-    
-    now = datetime.now()
-    if res and res[0]:
-        last_bonus_time = datetime.fromisoformat(res[0])
-        if now - last_bonus_time < timedelta(hours=24):
-            conn.close()
-            remaining = timedelta(hours=24) - (now - last_bonus_time)
-            hours, remainder = divmod(int(remaining.total_seconds()), 3600)
-            minutes, _ = divmod(remainder, 60)
-            return False, f"Бонус уже получен! Зайдите через {hours}ч {minutes}мин."
-
-    cursor.execute("UPDATE users SET balance = balance + 220, last_bonus = ? WHERE user_id = ?", (now.isoformat(), user_id))
-    conn.commit()
-    conn.close()
-    return True, "🎉 Вы получили ежедневный бонус: +220 коинов!"
+# --- ХРАНИЛИЩЕ СОСТОЯНИЙ ИГР И СТАВОК ---
+active_games = {}
+pending_bets = {}  # {user_id: current_bet_amount}
 
 # --- КЛАВИАТУРЫ ---
-def get_main_keyboard():
+def get_bet_keyboard(current_bet: int):
+    """Таблица для выбора и настройки ставки от 1 до 1 000 000"""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎁 Ежедневный бонус (+220)", callback_data="claim_bonus")],
-        [InlineKeyboardButton(text="👤 Профиль / Вывод", callback_data="show_profile")]
+        [
+            InlineKeyboardButton(text="➕ 1K", callback_data="bet_add_1000"),
+            InlineKeyboardButton(text="➕ 10K", callback_data="bet_add_10000"),
+            InlineKeyboardButton(text="➕ 100K", callback_data="bet_add_100000")
+        ],
+        [
+            InlineKeyboardButton(text="✖️2 (Удвоить)", callback_data="bet_x2"),
+            InlineKeyboardButton(text="🔥 MAX (1M)", callback_data="bet_max"),
+            InlineKeyboardButton(text="🔄 Сброс (1)", callback_data="bet_reset")
+        ],
+        [
+            InlineKeyboardButton(text=f"🎮 Подтвердить ставку ({current_bet:,} 💰)", callback_data="bet_confirm")
+        ]
     ])
 
 def get_rps_keyboard(game_id: str):
@@ -91,77 +87,86 @@ def get_rps_keyboard(game_id: str):
         ]
     ])
 
-# Хранилище активных игр
-active_games = {}
-
-# --- ОБРАБОТЧИКИ КОМАНД ---
-@dp.message(CommandStart())
-async def cmd_start(message: Message):
-    get_user(message.from_user.id, message.from_user.first_name)
-    text = (
-        f"Привет, {message.from_user.first_name}!\n\n"
-        "🎮 Напиши `.play` в чат, чтобы начать игру в **Камень, Ножницы, Бумага**.\n"
-        "💰 За победу: **+50 коинов**, за поражение: **-10 коинов**.\n"
-        "🧸 Накопи **50,000 коинов**, чтобы вывести Мишку за 15 звёзд!"
-    )
-    await message.answer(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
-
+# --- ОБРАБОТКА СТАВОК И ИГРЫ ---
 @dp.message(F.text.startswith(".play"))
-async def start_game(message: Message):
+async def play_command(message: Message):
     user_id = message.from_user.id
-    user_name = message.from_user.first_name
-    get_user(user_id, user_name)
+    user = get_user(user_id, message.from_user.first_name)
+    balance = user[1]
 
-    game_id = f"game_{message.chat.id}_{random.randint(1000, 9999)}"
-    active_games[game_id] = {
-        "players": {},
-        "status": "waiting"
-    }
+    if balance < 1:
+        await message.answer("❌ У вас недостаточно коинов для игры! Нажмите `.bonus` или поддержите проект.")
+        return
+
+    # Устанавливаем начальную ставку в 1 коин
+    pending_bets[user_id] = 1
 
     text = (
-        "🎮 **Игра «Камень, ножницы, бумага» началась!**\n\n"
-        "Ждем 2 игроков. Нажмите на кнопку ниже, чтобы сделать выбор:"
+        f"🎯 **Выбор ставки для игры**\n\n"
+        f"💰 Ваш баланс: **{balance:,} коинов**\n"
+        f"🎲 Текущая ставка: **1 коин**\n\n"
+        f"Используйте таблицу ниже, чтобы настроить сумму ставки (от 1 до 1 000 000 коинов):"
     )
-    await message.answer(text, reply_markup=get_rps_keyboard(game_id), parse_mode="Markdown")
+    await message.answer(text, reply_markup=get_bet_keyboard(1), parse_mode="Markdown")
 
-@dp.message(F.text.startswith(".bonus"))
-async def bonus_command(message: Message):
-    get_user(message.from_user.id, message.from_user.first_name)
-    success, msg = claim_daily_bonus(message.from_user.id)
-    await message.answer(msg, parse_mode="Markdown")
-
-@dp.message(F.text.startswith(".profile") | F.text.startswith(".withdraw"))
-async def profile_command(message: Message):
-    user = get_user(message.from_user.id, message.from_user.first_name)
+@dp.callback_query(F.data.startswith("bet_"))
+async def process_bet_selection(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    user = get_user(user_id, callback.from_user.first_name)
     balance = user[1]
-    
-    text = f"👤 **Ваш профиль:**\n💰 Баланс: **{balance} коинов**\n\n"
-    if balance >= 50000:
-        text += "🧸 **Поздравляем!** У вас достаточно коинов для вывода **Мишки за 15 звёзд**!"
-    else:
-        text += f"🎯 До вывода Мишки за 15 звёзд осталось: **{50000 - balance} коинов**."
-        
-    await message.answer(text, parse_mode="Markdown")
 
-# --- ОБРАБОТЧИКИ КНОПОК ---
-@dp.callback_query(F.data == "claim_bonus")
-async def bonus_callback(callback: CallbackQuery):
-    get_user(callback.from_user.id, callback.from_user.first_name)
-    success, msg = claim_daily_bonus(callback.from_user.id)
-    await callback.answer(msg, show_alert=True)
+    current_bet = pending_bets.get(user_id, 1)
+    action = callback.data.replace("bet_", "")
 
-@dp.callback_query(F.data == "show_profile")
-async def profile_callback(callback: CallbackQuery):
-    user = get_user(callback.from_user.id, callback.from_user.first_name)
-    balance = user[1]
-    
-    text = f"👤 Профиль:\n💰 Баланс: {balance} коинов\n\n"
-    if balance >= 50000:
-        text += "🧸 Вы можете забрать Мишку за 15 звёзд!"
-    else:
-        text += f"🎯 До Мишки осталось: {50000 - balance} коинов."
-        
-    await callback.answer(text, show_alert=True)
+    if action == "add_1000":
+        current_bet += 1000
+    elif action == "add_10000":
+        current_bet += 10000
+    elif action == "add_100000":
+        current_bet += 100000
+    elif action == "x2":
+        current_bet *= 2
+    elif action == "max":
+        current_bet = min(balance, 1000000)
+    elif action == "reset":
+        current_bet = 1
+
+    # Валидация лимитов (от 1 до 1 000 000 и не больше баланса)
+    if current_bet > 1000000:
+        current_bet = 1000000
+    if current_bet > balance:
+        current_bet = balance
+    if current_bet < 1:
+        current_bet = 1
+
+    pending_bets[user_id] = current_bet
+
+    if action == "confirm":
+        # Создаем игру с фиксированной ставкой
+        game_id = f"game_{callback.message.chat.id}_{random.randint(1000, 9999)}"
+        active_games[game_id] = {
+            "bet": current_bet,
+            "players": {},
+            "status": "waiting"
+        }
+
+        await callback.message.edit_text(
+            f"🎮 **Игра «Камень, ножницы, бумага» создана!**\n\n"
+            f"💰 Ставка игры: **{current_bet:,} коинов**\n"
+            f"Ждем 2 игроков. Сделайте свой выбор ниже:",
+            reply_markup=get_rps_keyboard(game_id),
+            parse_mode="Markdown"
+        )
+        return
+
+    # Обновляем таблицу ставок
+    text = (
+        f"🎯 **Выбор ставки для игры**\n\n"
+        f"💰 Ваш баланс: **{balance:,} коинов**\n"
+        f"🎲 Текущая ставка: **{current_bet:,} коинов**\n\n"
+        f"Используйте таблицу ниже, чтобы настроить сумму ставки (от 1 до 1 000 000 коинов):"
+    )
+    await callback.message.edit_text(text, reply_markup=get_bet_keyboard(current_bet), parse_mode="Markdown")
 
 @dp.callback_query(F.data.startswith("choice_"))
 async def process_choice(callback: CallbackQuery):
@@ -171,16 +176,21 @@ async def process_choice(callback: CallbackQuery):
     
     user_id = callback.from_user.id
     user_name = callback.from_user.first_name
-    get_user(user_id, user_name)
+    user = get_user(user_id, user_name)
 
     if game_id not in active_games:
         await callback.answer("Эта игра уже завершена!", show_alert=True)
         return
 
     game = active_games[game_id]
+    bet = game["bet"]
+
+    if user[1] < bet:
+        await callback.answer(f"У вас недостаточно коинов для этой игры! Ставка: {bet:,}", show_alert=True)
+        return
 
     if user_id in game["players"]:
-        await callback.answer("Вы уже сделали выбор! Ждем второго игрока.", show_alert=True)
+        await callback.answer("Вы уже сделали выбор! Ожидаем второго игрока.", show_alert=True)
         return
 
     game["players"][user_id] = {"name": user_name, "choice": choice}
@@ -188,7 +198,8 @@ async def process_choice(callback: CallbackQuery):
 
     if len(game["players"]) == 1:
         await callback.message.edit_text(
-            f"🎮 **Игра идет!**\n\nИгрок **{user_name}** сделал выбор.\nОжидаем второго игрока...",
+            f"🎮 **Дуэль на {bet:,} коинов!**\n\n"
+            f"Игрок **{user_name}** сделал выбор.\nОжидаем второго соперника...",
             reply_markup=get_rps_keyboard(game_id),
             parse_mode="Markdown"
         )
@@ -196,7 +207,6 @@ async def process_choice(callback: CallbackQuery):
     elif len(game["players"]) == 2:
         await callback.message.edit_text("⏳ Оба игрока сделали выбор! Подсчитываем результаты...")
         
-        # Задержка 2 секунды перед оглашением результата
         await asyncio.sleep(2)
 
         players_list = list(game["players"].items())
@@ -207,27 +217,27 @@ async def process_choice(callback: CallbackQuery):
         choices_map = {"rock": "🗿 Камень", "scissors": "✂️ Ножницы", "paper": "📄 Бумага"}
 
         if c1 == c2:
-            result_text = "🤝 **Ничья!** Баланс не изменился."
+            result_text = "🤝 **Ничья!** Ставки возвращены."
         elif (c1 == "rock" and c2 == "scissors") or \
              (c1 == "scissors" and c2 == "paper") or \
              (c1 == "paper" and c2 == "rock"):
             
-            update_balance(p1_id, 50)
-            update_balance(p2_id, -10)
+            update_balance(p1_id, bet)
+            update_balance(p2_id, -bet)
             result_text = (
-                f"🏆 Победил **{p1_data['name']}**! (+50 коинов)\n"
-                f"💔 **{p2_data['name']}** проиграл. (-10 коинов)"
+                f"🏆 Победил **{p1_data['name']}**! (+{bet:,} коинов)\n"
+                f"💔 **{p2_data['name']}** проиграл (-{bet:,} коинов)"
             )
         else:
-            update_balance(p2_id, 50)
-            update_balance(p1_id, -10)
+            update_balance(p2_id, bet)
+            update_balance(p1_id, -bet)
             result_text = (
-                f"🏆 Победил **{p2_data['name']}**! (+50 коинов)\n"
-                f"💔 **{p1_data['name']}** проиграл. (-10 коинов)"
+                f"🏆 Победил **{p2_data['name']}**! (+{bet:,} коинов)\n"
+                f"💔 **{p1_data['name']}** проиграл (-{bet:,} коинов)"
             )
 
         final_msg = (
-            f"🎮 **Результаты дуэли:**\n\n"
+            f"🎮 **Результаты дуэли (Ставка: {bet:,} 💰):**\n\n"
             f"👤 **{p1_data['name']}**: {choices_map[c1]}\n"
             f"👤 **{p2_data['name']}**: {choices_map[c2]}\n\n"
             f"{result_text}"
