@@ -7,8 +7,8 @@ from aiogram.filters import CommandStart
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# Токен бота
-BOT_TOKEN = os.getenv("8955553619:AAHXJRmFKKRldxxJkUS22Cd-zbhBaLwf19Y").strip()
+# Новый токен с автоматической очисткой от случайных пробелов
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8955553619:AAHXJRmFKKRldxxJkUS22Cd-zbhBaLwf19Y").strip()
 
 # Инициализация бота и диспетчера
 bot = Bot(token=BOT_TOKEN)
