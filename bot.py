@@ -7,13 +7,14 @@ from aiogram.filters import CommandStart
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# Настройки и токен
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8955553619:AAGPRoVXir741kBwfYcGg6GlJhI4WzezK2Y").strip()
+# Токен бота
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8872260684:AAED-oo-qBqge-nTot8Kva1H4wxjRZvSHSM").strip()
 
+# Инициализация бота и диспетчера
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# Глобальные переменные
+# Хранилище состояний в ОЗУ (без Supabase)
 is_spamming = {}
 active_games = {}
 
@@ -43,7 +44,7 @@ async def cmd_start(message: Message):
     text = (
         "👋 **Бот активен!**\n\n"
         "Доступные команды:\n"
-        "• `.spam <текст>` — Запустить спам с интервалом 3 сек (остановка: `.stop`)\n"
+        "• `.spam <текст>` — Запустить спам (интервал 3 сек, остановка: `.stop`)\n"
         "• `.play` — Сыграть в Камень, Ножницы, Бумага"
     )
     await message.answer(text, parse_mode="Markdown")
@@ -115,7 +116,7 @@ async def handle_commands(chat_id: int, text: str, business_conn_id: str = None)
             await bot.send_message(chat_id=chat_id, text=msg_text, **kwargs)
 
     if text.startswith("."):
-        # Команда .play (Камень, Ножницы, Бумага)
+        # Команда .play
         if text == ".play":
             active_games[chat_id] = {"choices": {}}
             await send_msg(
@@ -136,13 +137,13 @@ async def handle_commands(chat_id: int, text: str, business_conn_id: str = None)
             while is_spamming.get(chat_id, False):
                 try:
                     await send_msg(msg)
-                    await asyncio.sleep(3.0)  # Интервал отправки отправки 3 секунды
+                    await asyncio.sleep(3.0)  # Интервал 3 секунды
                 except Exception as e:
                     logging.error(f"Ошибка при спаме: {e}")
                     break
             return True
 
-        # Команда .stop для остановки спама
+        # Команда .stop
         if text == ".stop":
             is_spamming[chat_id] = False
             await send_msg("🛑 **Спам остановлен.**", parse_mode="Markdown")
