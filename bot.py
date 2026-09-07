@@ -1,253 +1,388 @@
 import asyncio
 import logging
 import random
-import sqlite3
-from datetime import datetime, timedelta
-
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
-from aiogram.types import (
-    Message,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    CallbackQuery,
-    LabeledPrice,
-    PreCheckoutQuery
-)
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from supabase import create_client, Client
 
+# Настройки и ключи
 BOT_TOKEN = "8872260684:AAED-oo-qBqge-nTot8Kva1H4wxjRZvSHSM"
+SUPABASE_URL = "https://uzdorwhlwihwhvnedwkj.supabase.co"
+SUPABASE_KEY = "sb_publishable_GvTORvdPKyFzSp3Kjlx2HA_9OBY9xx-"
 
+# Инициализация Supabase, бота и диспетчера
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
 
-# --- БАЗА ДАННЫХ (SQLite) ---
-def init_db():
-    conn = sqlite3.connect("bot_database.db")
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            balance INTEGER DEFAULT 1000,
-            last_bonus TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
+# Хранилища состояний
+active_trolls = {}   # chat_id: bool
+afk_chats = {}       # chat_id: {"active": bool, "reason": str}
+global_afk = {"active": False, "reason": "Занят"}
+is_ghouling = False
 
-def get_user(user_id: int, username: str = "Аноним"):
-    conn = sqlite3.connect("bot_database.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id, balance, last_bonus FROM users WHERE user_id = ?", (user_id,))
-    user = cursor.fetchone()
-    if not user:
-        cursor.execute("INSERT INTO users (user_id, username, balance) VALUES (?, ?, ?)", (user_id, username, 1000))
-        conn.commit()
-        cursor.execute("SELECT user_id, balance, last_bonus FROM users WHERE user_id = ?", (user_id,))
-        user = cursor.fetchone()
-    conn.close()
-    return user
+# Состояния FSM для ввода текста автоответчика
+class AFKState(StatesGroup):
+    waiting_for_text = State()
 
-def update_balance(user_id: int, amount: int):
-    conn = sqlite3.connect("bot_database.db")
-    cursor = conn.cursor()
-    cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
-    conn.commit()
-    conn.close()
-
-# --- ХРАНИЛИЩЕ СОСТОЯНИЙ ИГР И СТАВОК ---
+# Хранилище заметок и активных игр
+notes = {}
 active_games = {}
-pending_bets = {}  # {user_id: current_bet_amount}
 
-# --- КЛАВИАТУРЫ ---
-def get_bet_keyboard(current_bet: int):
-    """Таблица для выбора и настройки ставки от 1 до 1 000 000"""
+# Список фраз для авто-троллинга (.a_troll)
+TROLL_PHRASES = [
+    "Спорить с тобой — это как играть в шахматы с голубем.",
+    "Ты всегда такой умный или сегодня особенный день?",
+    "Ага, очень интересно, продолжай (нет).",
+    "Мнение принято, отправлено в корзину.",
+    "1000-7, гуль, получается?"
+]
+
+# Регистрация / получение пользователя в Supabase
+async def get_or_create_user(user_id: int, username: str):
+    try:
+        response = supabase.table("profiles").select("*").eq("id", user_id).execute()
+        if not response.data:
+            new_user = {"id": user_id, "username": username, "balance": 100}
+            data = supabase.table("profiles").insert(new_user).execute()
+            return data.data[0], True
+        return response.data[0], False
+    except Exception as e:
+        logging.error(f"Ошибка БД: {e}")
+        return None, False
+
+# Главная панель управления (Клавиатура)
+def get_main_keyboard():
+    afk_btn_text = "🔴 Отключить автоответчик" if global_afk["active"] else "💤 Включить автоответчик"
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=afk_btn_text, callback_data="toggle_afk_panel")],
         [
-            InlineKeyboardButton(text="➕ 1K", callback_data="bet_add_1000"),
-            InlineKeyboardButton(text="➕ 10K", callback_data="bet_add_10000"),
-            InlineKeyboardButton(text="➕ 100K", callback_data="bet_add_100000")
-        ],
-        [
-            InlineKeyboardButton(text="✖️2 (Удвоить)", callback_data="bet_x2"),
-            InlineKeyboardButton(text="🔥 MAX (1M)", callback_data="bet_max"),
-            InlineKeyboardButton(text="🔄 Сброс (1)", callback_data="bet_reset")
-        ],
-        [
-            InlineKeyboardButton(text=f"🎮 Подтвердить ставку ({current_bet:,} 💰)", callback_data="bet_confirm")
+            InlineKeyboardButton(text="📖 Инструкция", callback_data="show_help"),
+            InlineKeyboardButton(text="🎮 Игра", callback_data="show_game_info")
         ]
     ])
 
-def get_rps_keyboard(game_id: str):
+# Клавиатура подтверждения отключения
+def get_confirm_turnoff_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🗿 Камень", callback_data=f"choice_rock_{game_id}"),
-            InlineKeyboardButton(text="✂️ Ножницы", callback_data=f"choice_scissors_{game_id}"),
-            InlineKeyboardButton(text="📄 Бумага", callback_data=f"choice_paper_{game_id}")
+            InlineKeyboardButton(text="✅ Да, отключить", callback_data="confirm_afk_off"),
+            InlineKeyboardButton(text="❌ Нет, оставить", callback_data="cancel_afk_off")
         ]
     ])
 
-# --- ОБРАБОТКА СТАВОК И ИГРЫ ---
-@dp.message(F.text.startswith(".play"))
-async def play_command(message: Message):
+# Игра КНБ
+def get_rps_keyboard(chat_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🗿 Камень", callback_data=f"rps_rock_{chat_id}"),
+            InlineKeyboardButton(text="✂️ Ножницы", callback_data=f"rps_scissors_{chat_id}"),
+            InlineKeyboardButton(text="📄 Бумага", callback_data=f"rps_paper_{chat_id}")
+        ]
+    ])
+
+def get_post_game_keyboard(chat_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🎮 Сыграть ещё раз", callback_data=f"rps_restart_{chat_id}"),
+            InlineKeyboardButton(text="❌ Не хочу играть", callback_data=f"rps_cancel_{chat_id}")
+        ]
+    ])
+
+# --- КОМАНДА /start И ПАНЕЛЬ ---
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
     user_id = message.from_user.id
-    user = get_user(user_id, message.from_user.first_name)
-    balance = user[1]
-
-    if balance < 1:
-        await message.answer("❌ У вас недостаточно коинов для игры! Нажмите `.bonus` или поддержите проект.")
-        return
-
-    # Устанавливаем начальную ставку в 1 коин
-    pending_bets[user_id] = 1
-
-    text = (
-        f"🎯 **Выбор ставки для игры**\n\n"
-        f"💰 Ваш баланс: **{balance:,} коинов**\n"
-        f"🎲 Текущая ставка: **1 коин**\n\n"
-        f"Используйте таблицу ниже, чтобы настроить сумму ставки (от 1 до 1 000 000 коинов):"
-    )
-    await message.answer(text, reply_markup=get_bet_keyboard(1), parse_mode="Markdown")
-
-@dp.callback_query(F.data.startswith("bet_"))
-async def process_bet_selection(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    user = get_user(user_id, callback.from_user.first_name)
-    balance = user[1]
-
-    current_bet = pending_bets.get(user_id, 1)
-    action = callback.data.replace("bet_", "")
-
-    if action == "add_1000":
-        current_bet += 1000
-    elif action == "add_10000":
-        current_bet += 10000
-    elif action == "add_100000":
-        current_bet += 100000
-    elif action == "x2":
-        current_bet *= 2
-    elif action == "max":
-        current_bet = min(balance, 1000000)
-    elif action == "reset":
-        current_bet = 1
-
-    # Валидация лимитов (от 1 до 1 000 000 и не больше баланса)
-    if current_bet > 1000000:
-        current_bet = 1000000
-    if current_bet > balance:
-        current_bet = balance
-    if current_bet < 1:
-        current_bet = 1
-
-    pending_bets[user_id] = current_bet
-
-    if action == "confirm":
-        # Создаем игру с фиксированной ставкой
-        game_id = f"game_{callback.message.chat.id}_{random.randint(1000, 9999)}"
-        active_games[game_id] = {
-            "bet": current_bet,
-            "players": {},
-            "status": "waiting"
-        }
-
-        await callback.message.edit_text(
-            f"🎮 **Игра «Камень, ножницы, бумага» создана!**\n\n"
-            f"💰 Ставка игры: **{current_bet:,} коинов**\n"
-            f"Ждем 2 игроков. Сделайте свой выбор ниже:",
-            reply_markup=get_rps_keyboard(game_id),
-            parse_mode="Markdown"
-        )
-        return
-
-    # Обновляем таблицу ставок
-    text = (
-        f"🎯 **Выбор ставки для игры**\n\n"
-        f"💰 Ваш баланс: **{balance:,} коинов**\n"
-        f"🎲 Текущая ставка: **{current_bet:,} коинов**\n\n"
-        f"Используйте таблицу ниже, чтобы настроить сумму ставки (от 1 до 1 000 000 коинов):"
-    )
-    await callback.message.edit_text(text, reply_markup=get_bet_keyboard(current_bet), parse_mode="Markdown")
-
-@dp.callback_query(F.data.startswith("choice_"))
-async def process_choice(callback: CallbackQuery):
-    parts = callback.data.split("_")
-    choice = parts[1]
-    game_id = f"{parts[2]}_{parts[3]}_{parts[4]}"
+    username = message.from_user.username or "Аноним"
+    await get_or_create_user(user_id, username)
     
-    user_id = callback.from_user.id
-    user_name = callback.from_user.first_name
-    user = get_user(user_id, user_name)
+    status_text = f"Статус автоответчика: **{'ВКЛЮЧЕН 🟢' if global_afk['active'] else 'ВЫКЛЮЧЕН 🔴'}**"
+    if global_afk["active"]:
+        status_text += f"\nТекущий текст: _{global_afk['reason']}_"
 
-    if game_id not in active_games:
-        await callback.answer("Эта игра уже завершена!", show_alert=True)
-        return
+    text = f"Привет, {username}!\nПанель управления Telegram Business.\n\n{status_text}"
+    await message.answer(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
 
-    game = active_games[game_id]
-    bet = game["bet"]
-
-    if user[1] < bet:
-        await callback.answer(f"У вас недостаточно коинов для этой игры! Ставка: {bet:,}", show_alert=True)
-        return
-
-    if user_id in game["players"]:
-        await callback.answer("Вы уже сделали выбор! Ожидаем второго игрока.", show_alert=True)
-        return
-
-    game["players"][user_id] = {"name": user_name, "choice": choice}
-    await callback.answer(f"Вы выбрали: {choice.upper()}!")
-
-    if len(game["players"]) == 1:
-        await callback.message.edit_text(
-            f"🎮 **Дуэль на {bet:,} коинов!**\n\n"
-            f"Игрок **{user_name}** сделал выбор.\nОжидаем второго соперника...",
-            reply_markup=get_rps_keyboard(game_id),
+# Нажатие на кнопку Автоответчика в панели
+@dp.callback_query(F.data == "toggle_afk_panel")
+async def process_afk_toggle_click(callback_query: CallbackQuery, state: FSMContext):
+    if not global_afk["active"]:
+        await state.set_state(AFKState.waiting_for_text)
+        await callback_query.message.answer("⌨️ **Напишите текст для автоответчика:**\n_(Этот текст будет отправляться всем в ЛС)_", parse_mode="Markdown")
+        await callback_query.answer()
+    else:
+        await callback_query.message.answer(
+            "⚠️ **Точно отключить автоответчик?**",
+            reply_markup=get_confirm_turnoff_keyboard(),
             parse_mode="Markdown"
         )
+        await callback_query.answer()
 
-    elif len(game["players"]) == 2:
-        await callback.message.edit_text("⏳ Оба игрока сделали выбор! Подсчитываем результаты...")
-        
-        await asyncio.sleep(2)
+# Прием текста автоответчика от пользователя
+@dp.message(AFKState.waiting_for_text)
+async def process_afk_text_input(message: Message, state: FSMContext):
+    text = message.text.strip()
+    global_afk["active"] = True
+    global_afk["reason"] = text
+    await state.clear()
+    
+    await message.answer(
+        f"✅ **Автоответчик успешно включен!**\n\nТекст ответа:\n_{text}_",
+        reply_markup=get_main_keyboard(),
+        parse_mode="Markdown"
+    )
 
-        players_list = list(game["players"].items())
-        p1_id, p1_data = players_list[0]
-        p2_id, p2_data = players_list[1]
+# Подтверждение отключения
+@dp.callback_query(F.data == "confirm_afk_off")
+async def process_confirm_afk_off(callback_query: CallbackQuery):
+    global_afk["active"] = False
+    await callback_query.message.edit_text("☀️ **Автоответчик выключен.**", parse_mode="Markdown")
+    await callback_query.answer("Автоответчик выключен!")
 
-        c1, c2 = p1_data["choice"], p2_data["choice"]
-        choices_map = {"rock": "🗿 Камень", "scissors": "✂️ Ножницы", "paper": "📄 Бумага"}
+# Отмена отключения
+@dp.callback_query(F.data == "cancel_afk_off")
+async def process_cancel_afk_off(callback_query: CallbackQuery):
+    await callback_query.message.edit_text("👍 Автоответчик остался **включенным**.", parse_mode="Markdown")
+    await callback_query.answer()
 
-        if c1 == c2:
-            result_text = "🤝 **Ничья!** Ставки возвращены."
-        elif (c1 == "rock" and c2 == "scissors") or \
-             (c1 == "scissors" and c2 == "paper") or \
-             (c1 == "paper" and c2 == "rock"):
-            
-            update_balance(p1_id, bet)
-            update_balance(p2_id, -bet)
-            result_text = (
-                f"🏆 Победил **{p1_data['name']}**! (+{bet:,} коинов)\n"
-                f"💔 **{p2_data['name']}** проиграл (-{bet:,} коинов)"
-            )
+# --- CALLBACKS ИНСТРУКЦИИ И ИГРЫ ---
+
+@dp.callback_query(F.data == "show_help")
+async def process_help_callback(callback_query: CallbackQuery):
+    help_text = (
+        "**Все доступные команды (FREE):**\n\n"
+        "⚡ `.ghoul` — Цикл 1000-7 (Dead Inside).\n"
+        "🛑 `.ghoulstop` — Остановить цикл 1000-7.\n"
+        "👤 `.info` — Информация о пользователе.\n"
+        "🎭 `.a_troll` — Включить/выключить авто-троллинг.\n"
+        "💤 `.afk [причина]` / `.unafk` — Быстрый автоответчик.\n"
+        "📌 `.note [имя] [текст]` / `.get [имя]` — Быстрые шаблоны.\n"
+        "🎮 `.starts` — Игра «Камень, ножницы, бумага»."
+    )
+    await callback_query.message.answer(help_text, parse_mode="Markdown")
+    await callback_query.answer()
+
+@dp.callback_query(F.data == "show_game_info")
+async def process_game_info_callback(callback_query: CallbackQuery):
+    await callback_query.message.answer("🎮 Запустите дуэль командой: `.starts`", parse_mode="Markdown")
+    await callback_query.answer()
+
+# Игра КНБ Handlers
+@dp.callback_query(lambda c: c.data and (c.data.startswith("rps_restart_") or c.data.startswith("rps_cancel_")))
+async def process_post_game_actions(callback_query: CallbackQuery):
+    parts = callback_query.data.split("_")
+    action, chat_id = parts[1], int(parts[2])
+
+    if action == "restart":
+        active_games[chat_id] = {"choices": {}}
+        await callback_query.message.edit_text("🎮 **Дуэль: Камень, ножницы, бумага!**", reply_markup=get_rps_keyboard(chat_id))
+    elif action == "cancel":
+        if chat_id in active_games: del active_games[chat_id]
+        try: await callback_query.message.delete()
+        except: await callback_query.message.edit_text("❌ Игра завершена.")
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("rps_"))
+async def process_rps_choice(callback_query: CallbackQuery):
+    parts = callback_query.data.split("_")
+    choice, chat_id = parts[1], int(parts[2])
+    user_id, user_name = callback_query.from_user.id, callback_query.from_user.first_name
+
+    if chat_id not in active_games:
+        await callback_query.answer("Игра не найдена. Напишите .starts", show_alert=True)
+        return
+
+    game = active_games[chat_id]
+    game["choices"][user_id] = {"choice": choice, "name": user_name}
+    await callback_query.answer(f"Вы выбрали {choice.upper()}!")
+
+    if len(game["choices"]) >= 2:
+        await callback_query.message.edit_text("⏳ Подсчитываем результаты...")
+        await asyncio.sleep(1.5)
+        players = list(game["choices"].values())
+        p1, p2 = players[0], players[1]
+        c1, c2 = p1["choice"], p2["choice"]
+
+        if c1 == c2: result = "🤝 **Ничья!**"
+        elif (c1=="rock" and c2=="scissors") or (c1=="scissors" and c2=="paper") or (c1=="paper" and c2=="rock"):
+            result = f"🏆 Победил **{p1['name']}**!"
         else:
-            update_balance(p2_id, bet)
-            update_balance(p1_id, -bet)
-            result_text = (
-                f"🏆 Победил **{p2_data['name']}**! (+{bet:,} коинов)\n"
-                f"💔 **{p1_data['name']}** проиграл (-{bet:,} коинов)"
+            result = f"🏆 Победил **{p2['name']}**!"
+
+        res_text = f"🎮 **Результаты:**\n👤 **{p1['name']}**: {c1}\n👤 **{p2['name']}**: {c2}\n\n{result}"
+        await callback_query.message.edit_text(res_text, reply_markup=get_post_game_keyboard(chat_id), parse_mode="Markdown")
+
+# --- ОСНОВНОЙ ОБРАБОТЧИК TELEGRAM BUSINESS ---
+
+@dp.business_message()
+async def handle_business_message(message: Message):
+    global active_trolls, is_ghouling, active_games, global_afk, afk_chats, notes
+    
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    text = (message.text or "").strip()
+    conn_id = message.business_connection_id
+
+    if not conn_id:
+        return
+
+    is_me = (user_id != chat_id)
+    is_partner = not is_me
+
+    # =============================================================
+    # 1. КОМАНДЫ ВЛАДЕЛЬЦА АККАУНТА
+    # =============================================================
+    if is_me:
+        if text.startswith("."):
+            if text.startswith(".afk"):
+                reason = text[4:].strip() or "Сплю"
+                afk_chats[chat_id] = {"active": True, "reason": reason}
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"💤 **Режим AFK включен в этом чате.**\nПричина: {reason}",
+                    business_connection_id=conn_id,
+                    parse_mode="Markdown"
+                )
+                return
+
+            elif text.startswith(".unafk"):
+                afk_chats[chat_id] = {"active": False, "reason": ""}
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="☀️ **Режим AFK выключен в этом чате.**",
+                    business_connection_id=conn_id,
+                    parse_mode="Markdown"
+                )
+                return
+
+            elif text == ".ghoulstop":
+                is_ghouling = False
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="🛑 **Цикл 1000-7 остановлен.**",
+                    business_connection_id=conn_id,
+                    parse_mode="Markdown"
+                )
+                return
+
+            elif text == ".ghoul":
+                if is_ghouling: return
+                is_ghouling = True
+                val = 1000
+                while val > 0 and is_ghouling:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=f"{val} - 7 = {val - 7}",
+                        business_connection_id=conn_id
+                    )
+                    val -= 7
+                    await asyncio.sleep(0.3)
+                    if val < 7: break
+                if is_ghouling:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text="я гуль...",
+                        business_connection_id=conn_id
+                    )
+                is_ghouling = False
+                return
+
+            elif text == ".info":
+                user = message.from_user
+                info_msg = (
+                    f"👤 **Информация о пользователе:**\n\n"
+                    f"• **Имя:** {user.first_name}\n"
+                    f"• **ID:** `{user.id}`\n"
+                    f"• **Username:** @{user.username if user.username else 'отсутствует'}"
+                )
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=info_msg,
+                    business_connection_id=conn_id,
+                    parse_mode="Markdown"
+                )
+                return
+
+            elif text == ".a_troll":
+                current_status = active_trolls.get(chat_id, False)
+                active_trolls[chat_id] = not current_status
+                status = "включен 🎭" if active_trolls[chat_id] else "выключен 🛑"
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"Режим авто-троллинга **{status}**",
+                    business_connection_id=conn_id,
+                    parse_mode="Markdown"
+                )
+                return
+
+            elif text.startswith(".note"):
+                args = text[5:].strip().split(maxsplit=1)
+                if len(args) == 2:
+                    notes[args[0].lower()] = args[1]
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=f"📌 Заметка **'{args[0]}'** сохранена!",
+                        business_connection_id=conn_id,
+                        parse_mode="Markdown"
+                    )
+                return
+
+            elif text.startswith(".get"):
+                note_name = text[4:].strip().lower()
+                res = notes.get(note_name, f"❌ Заметка **'{note_name}'** не найдена.")
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=res,
+                    business_connection_id=conn_id,
+                    parse_mode="Markdown"
+                )
+                return
+
+            elif text == ".starts":
+                active_games[chat_id] = {"choices": {}}
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="🎮 **Дуэль: Камень, ножницы, бумага!**",
+                    reply_markup=get_rps_keyboard(chat_id),
+                    business_connection_id=conn_id,
+                    parse_mode="Markdown"
+                )
+                return
+
+    # =============================================================
+    # 2. РЕАКЦИЯ НА ВХОДЯЩИЕ СООБЩЕНИЯ ОТ СОБЕСЕДНИКА
+    # =============================================================
+    if is_partner:
+        chat_afk = afk_chats.get(chat_id, {"active": False})
+        if chat_afk.get("active"):
+            await bot.send_message(
+                chat_id=chat_id,
+                text=chat_afk["reason"],
+                business_connection_id=conn_id
             )
+            return
+        elif global_afk["active"] and message.chat.type == "private":
+            await bot.send_message(
+                chat_id=chat_id,
+                text=global_afk["reason"],
+                business_connection_id=conn_id
+            )
+            return
 
-        final_msg = (
-            f"🎮 **Результаты дуэли (Ставка: {bet:,} 💰):**\n\n"
-            f"👤 **{p1_data['name']}**: {choices_map[c1]}\n"
-            f"👤 **{p2_data['name']}**: {choices_map[c2]}\n\n"
-            f"{result_text}"
-        )
-
-        await callback.message.edit_text(final_msg, parse_mode="Markdown")
-        del active_games[game_id]
+        if active_trolls.get(chat_id, False):
+            await bot.send_message(
+                chat_id=chat_id,
+                text=random.choice(TROLL_PHRASES),
+                business_connection_id=conn_id
+            )
+            return
 
 async def main():
-    init_db()
     logging.basicConfig(level=logging.INFO)
     await dp.start_polling(bot)
 
