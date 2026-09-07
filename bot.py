@@ -359,124 +359,153 @@ async def handle_business_message(message: Message):
     if not conn_id:
         return
 
-    # 1. Автоответчик (для входящих личных сообщений)
-    if afk_status["active"] and message.chat.type == "private":
-        if message.from_user and message.from_user.id != message.chat.id:
+    # ОПРЕДЕЛЕНИЕ АВТОРА СООБЩЕНИЯ
+    is_me = (user_id != chat_id)         # Отправили ВЫ (владелец аккаунта)
+    is_partner = (user_id == chat_id)    # Отправил СОБЕСЕДНИК
+
+    # -------------------------------------------------------------
+    # 1. ЛОГИКА ДЛЯ ВАШИХ СООБЩЕНИЙ (Когда пишете ВЫ)
+    # -------------------------------------------------------------
+    if is_me:
+        # Дублирование отправленного сообщения
+        if text and not text.startswith("."):
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"🔁 **Дубликат:** {text}",
+                business_connection_id=conn_id,
+                parse_mode="Markdown"
+            )
+
+        # Остановка спама по вашей команде
+        if text.startswith(".stop"):
+            active_spams[chat_id] = False
+            await bot.send_message(
+                chat_id=chat_id, 
+                text="🛑 Спам остановлен владельцем.", 
+                business_connection_id=conn_id
+            )
+            return
+
+    # -------------------------------------------------------------
+    # 2. ЛОГИКА ДЛЯ СООБЩЕНИЙ СОБЕСЕДНИКА (Когда пишет СОБЕСЕДНИК)
+    # -------------------------------------------------------------
+    if is_partner:
+
+        # Автоответчик (AFK)
+        if afk_status["active"] and message.chat.type == "private":
             await bot.send_message(
                 chat_id=chat_id,
                 text=afk_status["reason"],
                 business_connection_id=conn_id
             )
-            return
 
-    # 2. Обработка команд
-    if text.startswith("."):
-        
-        # --- БЕСПЛАТНЫЕ КОМАНДЫ ---
-        
-        if text.startswith(".spam"):
-            msg = text[5:].strip()
-            if msg:
-                active_spams[chat_id] = True
-                while active_spams.get(chat_id, False):
-                    await bot.send_message(
-                        chat_id=chat_id, 
-                        text=msg, 
-                        business_connection_id=conn_id
-                    )
-                    await asyncio.sleep(1.5)
-            return
-
-        elif text == ".info":
-            user = message.from_user
-            info_msg = (
-                f"👤 **Информация о пользователе:**\n\n"
-                f"• **Имя:** {user.first_name}\n"
-                f"• **ID:** `{user.id}`\n"
-                f"• **Username:** @{user.username if user.username else 'отсутствует'}\n"
-                f"• **Премиум:** {'Да' if user.is_premium else 'Нет'}"
-            )
+        # Режим авто-троллинга
+        if active_trolls.get(chat_id, False):
             await bot.send_message(
                 chat_id=chat_id,
-                text=info_msg,
-                business_connection_id=conn_id,
-                parse_mode="Markdown"
-            )
-            return
-
-        elif text == ".starts":
-            active_games[chat_id] = {"choices": {}}
-            await bot.send_message(
-                chat_id=chat_id,
-                text="🎮 **Дуэль: Камень, ножницы, бумага!**\n\n⏳ Ожидание игроков...\n📊 Проголосовало: **0/2**",
-                reply_markup=get_rps_keyboard(chat_id),
-                business_connection_id=conn_id,
-                parse_mode="Markdown"
-            )
-            return
-
-        elif text == ".stop":
-            active_spams[chat_id] = False
-            await bot.send_message(
-                chat_id=chat_id, 
-                text="🛑 Спам остановлен.", 
+                text=random.choice(TROLL_PHRASES),
                 business_connection_id=conn_id
             )
-            return
 
-        # --- ПЛАТНЫЕ ПРЕМИУМ КОМАНДЫ ---
+        # ОБРАБОТКА КОМАНД СОБЕСЕДНИКА
+        if text.startswith("."):
+            
+            # --- Бесплатные команды ---
+            
+            if text.startswith(".spam"):
+                msg = text[5:].strip()
+                if msg:
+                    active_spams[chat_id] = True
+                    while active_spams.get(chat_id, False):
+                        await bot.send_message(
+                            chat_id=chat_id, 
+                            text=msg, 
+                            business_connection_id=conn_id
+                        )
+                        await asyncio.sleep(1.5)
+                return
 
-        elif text.startswith(".killerspam"):
-            if user_id not in premium_users:
-                await send_premium_invoice(user_id)
+            elif text == ".info":
+                user = message.from_user
+                info_msg = (
+                    f"👤 **Информация о собеседнике:**\n\n"
+                    f"• **Имя:** {user.first_name}\n"
+                    f"• **ID:** `{user.id}`\n"
+                    f"• **Username:** @{user.username if user.username else 'отсутствует'}\n"
+                    f"• **Премиум:** {'Да' if user.is_premium else 'Нет'}"
+                )
                 await bot.send_message(
                     chat_id=chat_id,
-                    text=f"⭐ **Команда доступна только Премиум-пользователям!**\nСчет на оплату ({PREMIUM_PRICE_STARS} Stars) отправлен вам в ЛС.",
+                    text=info_msg,
+                    business_connection_id=conn_id,
+                    parse_mode="Markdown"
+                )
+                return
+
+            elif text == ".starts":
+                active_games[chat_id] = {"choices": {}}
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="🎮 **Дуэль: Камень, ножницы, бумага!**\n\n⏳ Ожидание игроков...\n📊 Проголосовало: **0/2**",
+                    reply_markup=get_rps_keyboard(chat_id),
+                    business_connection_id=conn_id,
+                    parse_mode="Markdown"
+                )
+                return
+
+            elif text == ".stop":
+                active_spams[chat_id] = False
+                await bot.send_message(
+                    chat_id=chat_id, 
+                    text="🛑 Спам остановлен.", 
                     business_connection_id=conn_id
                 )
                 return
 
-            msg = text[11:].strip()
-            if msg:
-                active_spams[chat_id] = True
-                while active_spams.get(chat_id, False):
+            # --- Платные Премиум команды ---
+
+            elif text.startswith(".killerspam"):
+                if user_id not in premium_users:
+                    await send_premium_invoice(user_id)
                     await bot.send_message(
-                        chat_id=chat_id, 
-                        text=msg, 
+                        chat_id=chat_id,
+                        text=f"⭐ **Команда доступна только Премиум-пользователям!**\nСчет на оплату ({PREMIUM_PRICE_STARS} Stars) отправлен вам в ЛС.",
                         business_connection_id=conn_id
                     )
-                    await asyncio.sleep(0.01)
-            return
+                    return
 
-        elif text == ".a_troll":
-            if user_id not in premium_users:
-                await send_premium_invoice(user_id)
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=f"⭐ **Команда доступна только Премиум-пользователям!**\nСчет на оплату ({PREMIUM_PRICE_STARS} Stars) отправлен вам в ЛС.",
-                    business_connection_id=conn_id
-                )
+                msg = text[11:].strip()
+                if msg:
+                    active_spams[chat_id] = True
+                    while active_spams.get(chat_id, False):
+                        await bot.send_message(
+                            chat_id=chat_id, 
+                            text=msg, 
+                            business_connection_id=conn_id
+                        )
+                        await asyncio.sleep(0.01)
                 return
 
-            current_status = active_trolls.get(chat_id, False)
-            active_trolls[chat_id] = not current_status
-            status_text = "включен 🎭" if active_trolls[chat_id] else "выключен 🛑"
-            await bot.send_message(
-                chat_id=chat_id,
-                text=f"Режим авто-троллинга **{status_text}**",
-                business_connection_id=conn_id,
-                parse_mode="Markdown"
-            )
-            return
+            elif text == ".a_troll":
+                if user_id not in premium_users:
+                    await send_premium_invoice(user_id)
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=f"⭐ **Команда доступна только Премиум-пользователям!**\nСчет на оплату ({PREMIUM_PRICE_STARS} Stars) отправлен вам в ЛС.",
+                        business_connection_id=conn_id
+                    )
+                    return
 
-    # 3. Авто-троллинг
-    if active_trolls.get(chat_id, False):
-        await bot.send_message(
-            chat_id=chat_id,
-            text=random.choice(TROLL_PHRASES),
-            business_connection_id=conn_id
-        )
-        return
+                current_status = active_trolls.get(chat_id, False)
+                active_trolls[chat_id] = not current_status
+                status_text = "включен 🎭" if active_trolls[chat_id] else "выключен 🛑"
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"Режим авто-троллинга **{status_text}**",
+                    business_connection_id=conn_id,
+                    parse_mode="Markdown"
+                )
+                return
 
 async def main():
     logging.basicConfig(level=logging.INFO)
