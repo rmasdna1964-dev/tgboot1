@@ -1,20 +1,24 @@
 import asyncio
 import logging
 import os
+import sys
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# Новый токен с автоматической очисткой от случайных пробелов
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8955553619:AAHXJRmFKKRldxxJkUS22Cd-zbhBaLwf19Y").strip()
+# Получение токена из переменных окружения
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# Инициализация бота и диспетчера
-bot = Bot(token=BOT_TOKEN)
+if not BOT_TOKEN:
+    print("❌ Ошибка: Переменная BOT_TOKEN не найдена в окружении!")
+    sys.exit(1)
+
+bot = Bot(token=BOT_TOKEN.strip())
 dp = Dispatcher(storage=MemoryStorage())
 
-# Хранилище состояний в ОЗУ (без Supabase)
+# Хранилище состояний в ОЗУ
 is_spamming = {}
 active_games = {}
 
