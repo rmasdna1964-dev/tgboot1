@@ -50,6 +50,7 @@ dp = Dispatcher()
 business_owners: Dict[str, int] = {}
 business_connections: Dict[str, Any] = {}
 autoresponders: Dict[int, Dict[str, Any]] = {}
+active_games: Dict[int, Dict[str, Any]] = {}
 active_trolls: Dict[int, bool] = {}
 is_ghouling: Dict[int, bool] = {}
 notes: Dict[int, list] = {}
@@ -69,6 +70,7 @@ def main_panel() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🤖 Автоответчик", callback_data="panel_autoresponder")],
+            [InlineKeyboardButton(text="🎮 Камень-ножницы-бумага", callback_data="panel_rps")],
             [InlineKeyboardButton(text="ℹ️ Помощь", callback_data="panel_help")],
         ]
     )
@@ -94,8 +96,25 @@ def disable_confirm_keyboard() -> InlineKeyboardMarkup:
         ]
     )
 
+def rps_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🪨 Камень", callback_data=f"rps:rock:{chat_id}")],
+            [InlineKeyboardButton(text="✂️ Ножницы", callback_data=f"rps:scissors:{chat_id}")],
+            [InlineKeyboardButton(text="📄 Бумага", callback_data=f"rps:paper:{chat_id}")],
+        ]
+    )
+
+def rps_after_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🎮 Играть ещё", callback_data=f"rps_again:{chat_id}")],
+            [InlineKeyboardButton(text="❌ Отказаться", callback_data=f"rps_cancel:{chat_id}")]
+        ]
+    )
+
 # ============================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# BUSINESS CONNECTION & SEND
 # ============================================================
 
 async def get_connection_info(connection_id: str):
@@ -113,13 +132,12 @@ async def get_connection_info(connection_id: str):
         logging.exception("Ошибка получения Business Connection")
         return None
 
-async def send_reply(
+async def business_send(
     chat_id: int,
     text: str,
     connection_id: Optional[str] = None,
     reply_markup: Optional[InlineKeyboardMarkup] = None
 ):
-    """Универсальная отправка сообщений (работает как для ЛС, так и для Business API)."""
     kwargs = {"chat_id": chat_id, "text": text}
     if reply_markup:
         kwargs["reply_markup"] = reply_markup
@@ -127,95 +145,6 @@ async def send_reply(
         kwargs["business_connection_id"] = connection_id
 
     return await bot.send_message(**kwargs)
-
-# ============================================================
-# ЕДИНАЯ ЛОГИКА ОБРАБОТКИ СООБЩЕНИЙ
-# ============================================================
-
-async def process_command_or_autorespond(message: Message, is_owner: bool, connection_id: Optional[str] = None):
-    text = (message.text or "").strip()
-    chat_id = message.chat.id
-    lower = text.lower()
-
-    # 1. ОБРАБОТКА КОМАНД (ТОЛЬКО ОТ ВЛАДЕЛЬЦА)
-    if is_owner and text.startswith("."):
-        if lower.startswith(".spam"):
-            parts = text.split(maxsplit=1)
-            if len(parts) < 2:
-                await send_reply(chat_id, "❌ Укажите текст: <code>.spam текст</code>", connection_id)
-                return True
-            spam_text = parts[1].strip()
-            autoresponders[chat_id] = {"enabled": True, "text": spam_text}
-            await send_reply(chat_id, f"✅ <b>Автоответчик включён:</b>\n<blockquote>{spam_text}</blockquote>", connection_id)
-            return True
-
-        if lower == ".info":
-            user = message.from_user
-            username = f"@{user.username}" if user and user.username else "нет"
-            info_text = (
-                f"ℹ️ <b>Инфо о собеседнике</b>\n\n"
-                f"👤 Имя: <b>{user.full_name if user else 'Неизвестно'}</b>\n"
-                f"🆔 ID: <code>{user.id if user else 'N/A'}</code>\n"
-                f"🔗 Username: {username}\n"
-                f"💬 Chat ID: <code>{chat_id}</code>"
-            )
-            await send_reply(chat_id, info_text, connection_id)
-            return True
-
-        if lower == ".ghoul":
-            is_ghouling[chat_id] = True
-            await send_reply(chat_id, "👻 <b>Ghoul включён.</b>", connection_id)
-            return True
-
-        if lower == ".ghoulstop":
-            is_ghouling[chat_id] = False
-            await send_reply(chat_id, "👻 <b>Ghoul выключен.</b>", connection_id)
-            return True
-
-        if lower == ".a_troll":
-            active_trolls[chat_id] = True
-            await send_reply(chat_id, "😈 <b>A-Troll включён.</b>", connection_id)
-            return True
-
-        if lower.startswith(".note"):
-            parts = text.split(maxsplit=1)
-            if len(parts) >= 2:
-                notes.setdefault(chat_id, []).append(parts[1])
-                await send_reply(chat_id, "📝 <b>Заметка сохранена.</b>", connection_id)
-            return True
-
-        if lower == ".get":
-            user_notes = notes.get(chat_id, [])
-            out = "📝 Заметок нет." if not user_notes else "📝 <b>Заметки:</b>\n\n" + "\n".join(f"{i+1}. {n}" for i, n in enumerate(user_notes))
-            await send_reply(chat_id, out, connection_id)
-            return True
-
-    # 2. РЕАКЦИИ НА СООБЩЕНИЯ (ДЛЯ Собеседников или Владельца, если активен режим)
-    if not is_owner:
-        ar = autoresponders.get(chat_id)
-        if ar and ar.get("enabled") and ar.get("text"):
-            try:
-                await send_reply(chat_id, ar["text"], connection_id)
-            except Exception:
-                pass
-            return True
-
-        if is_ghouling.get(chat_id):
-            try:
-                await send_reply(chat_id, "👻 Ты написал в пустоту...", connection_id)
-            except Exception:
-                pass
-            return True
-
-        if active_trolls.get(chat_id):
-            troll_msgs = ["😈 Я всё вижу.", "👀 Интересно...", "🤨 Ты точно хотел это написать?", "🗿 Понял."]
-            try:
-                await send_reply(chat_id, random.choice(troll_msgs), connection_id)
-            except Exception:
-                pass
-            return True
-
-    return False
 
 # ============================================================
 # START & PANEL HANDLERS
@@ -240,6 +169,7 @@ async def panel_help(callback: CallbackQuery):
         "ℹ️ <b>Команды управления в чатах:</b>\n\n"
         "<code>.spam текст</code> — установить текст автоответчика\n"
         "<code>.info</code> — информация о собеседнике\n"
+        "<code>.starts</code> — начать КНБ\n"
         "<code>.ghoul</code> — режим Ghoul\n"
         "<code>.ghoulstop</code> — выключить Ghoul\n"
         "<code>.a_troll</code> — режим Troll\n"
@@ -323,22 +253,6 @@ async def ar_disable_no(callback: CallbackQuery):
     await panel_autoresponder(callback)
 
 # ============================================================
-# ОБРАБОТКА ОБЫЧНЫХ СООБЩЕНИЙ В ЛС И ГРУППАХ
-# ============================================================
-
-@dp.message(F.chat.type == "private")
-async def private_message_handler(message: Message):
-    # Если запущен FSM, пропускаем
-    if await dp.storage.get_state(bot=bot, key=message.chat.id):
-        return
-
-    # В обычном Telegram Bot API бот реагирует на любого пользователя
-    # Если вам нужно ограничить управление только для себя — проверяйте ID (например, your_user_id)
-    is_owner = True  # По умолчанию считаем, что тот, кто пишет команду в ЛС бота — её владелец
-
-    await process_command_or_autorespond(message, is_owner=is_owner)
-
-# ============================================================
 # ОБРАБОТКА ВСЕХ БИЗНЕС СООБЩЕНИЙ
 # ============================================================
 
@@ -358,8 +272,92 @@ async def business_message_handler(message: Message):
     if message.sender_business_bot:
         return
 
-    is_owner = (sender_id == owner_id)
-    await process_command_or_autorespond(message, is_owner=is_owner, connection_id=connection_id)
+    # КОМАНДЫ ОТ ВЛАДЕЛЬЦА АККАУНТА
+    if sender_id == owner_id:
+        text = (message.text or "").strip()
+        if not text:
+            return
+
+        lower = text.lower()
+
+        if lower.startswith(".spam"):
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2:
+                await business_send(message.chat.id, "❌ Укажите текст: <code>.spam текст</code>", connection_id)
+                return
+            spam_text = parts[1].strip()
+            autoresponders[message.chat.id] = {"enabled": True, "text": spam_text}
+            await business_send(message.chat.id, f"✅ <b>Автоответчик включён:</b>\n<blockquote>{spam_text}</blockquote>", connection_id)
+            return
+
+        if lower == ".info":
+            user = message.from_user
+            username = f"@{user.username}" if user and user.username else "нет"
+            info_text = (
+                f"ℹ️ <b>Инфо о собеседнике</b>\n\n"
+                f"👤 Имя: <b>{user.full_name if user else 'Неизвестно'}</b>\n"
+                f"🆔 ID: <code>{user.id if user else 'N/A'}</code>\n"
+                f"🔗 Username: {username}\n"
+                f"💬 Chat ID: <code>{message.chat.id}</code>"
+            )
+            await business_send(message.chat.id, info_text, connection_id)
+            return
+
+        if lower == ".ghoul":
+            is_ghouling[message.chat.id] = True
+            await business_send(message.chat.id, "👻 <b>Ghoul включён.</b>", connection_id)
+            return
+
+        if lower == ".ghoulstop":
+            is_ghouling[message.chat.id] = False
+            await business_send(message.chat.id, "👻 <b>Ghoul выключен.</b>", connection_id)
+            return
+
+        if lower == ".a_troll":
+            active_trolls[message.chat.id] = True
+            await business_send(message.chat.id, "😈 <b>A-Troll включён.</b>", connection_id)
+            return
+
+        if lower.startswith(".note"):
+            parts = text.split(maxsplit=1)
+            if len(parts) >= 2:
+                notes.setdefault(message.chat.id, []).append(parts[1])
+                await business_send(message.chat.id, "📝 <b>Заметка сохранена.</b>", connection_id)
+            return
+
+        if lower == ".get":
+            user_notes = notes.get(message.chat.id, [])
+            out = "📝 Заметок нет." if not user_notes else "📝 <b>Заметки:</b>\n\n" + "\n".join(f"{i+1}. {n}" for i, n in enumerate(user_notes))
+            await business_send(message.chat.id, out, connection_id)
+            return
+
+        return
+
+    # РЕАКЦИЯ НА ВХОДЯЩИЕ СООБЩЕНИЯ СОБЕСЕДНИКА
+    chat_id = message.chat.id
+
+    ar = autoresponders.get(chat_id)
+    if ar and ar.get("enabled") and ar.get("text"):
+        try:
+            await business_send(chat_id, ar["text"], connection_id)
+        except Exception:
+            pass
+        return
+
+    if is_ghouling.get(chat_id):
+        try:
+            await business_send(chat_id, "👻 Ты написал в пустоту...", connection_id)
+        except Exception:
+            pass
+        return
+
+    if active_trolls.get(chat_id):
+        troll_msgs = ["😈 Я всё вижу.", "👀 Интересно...", "🤨 Ты точно хотел это написать?", "🗿 Понял."]
+        try:
+            await business_send(chat_id, random.choice(troll_msgs), connection_id)
+        except Exception:
+            pass
+        return
 
 # ============================================================
 # ЗАПУСК
