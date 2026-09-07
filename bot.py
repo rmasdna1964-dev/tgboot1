@@ -1,219 +1,243 @@
 import asyncio
 import logging
 import random
-import aiohttp
-from aiogram import Bot, Dispatcher, types
+import sqlite3
+from datetime import datetime, timedelta
+
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from supabase import create_client, Client
+from aiogram.types import (
+    Message,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery
+)
 
-# Настройки и ключи
+# Вставьте ваш НОВЫЙ токен от BotFather
 BOT_TOKEN = "8872260684:AAED-oo-qBqge-nTot8Kva1H4wxjRZvSHSM"
-SUPABASE_URL = "https://uzdorwhlwihwhvnedwkj.supabase.co"
-SUPABASE_KEY = "sb_publishable_GvTORvdPKyFzSp3Kjlx2HA_9OBY9xx-"
 
-# Инициализация Supabase и бота
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Глобальные переменные управления
-is_trolling = False
-is_ghouling = False
+# --- БАЗА ДАННЫХ (SQLite) ---
+def init_db():
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            balance INTEGER DEFAULT 0,
+            last_bonus TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
 
-# Хранилище активных фоновых задач спама: {chat_id: asyncio.Task}
-active_spams = {}
+def get_user(user_id: int, username: str = "Аноним"):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, balance, last_bonus FROM users WHERE user_id = ?", (user_id,))
+    user = cursor.fetchone()
+    if not user:
+        cursor.execute("INSERT INTO users (user_id, username, balance) VALUES (?, ?, ?)", (user_id, username, 0))
+        conn.commit()
+        cursor.execute("SELECT user_id, balance, last_bonus FROM users WHERE user_id = ?", (user_id,))
+        user = cursor.fetchone()
+    conn.close()
+    return user
 
-# Состояние AFK
-afk_status = {"active": False, "reason": "Занят"}
+def update_balance(user_id: int, amount: int):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
+    conn.commit()
+    conn.close()
 
-# Хранилище заметок и активных игр
-notes = {}
-active_games = {}
+def claim_daily_bonus(user_id: int):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT last_bonus FROM users WHERE user_id = ?", (user_id,))
+    res = cursor.fetchone()
+    
+    now = datetime.now()
+    if res and res[0]:
+        last_bonus_time = datetime.fromisoformat(res[0])
+        if now - last_bonus_time < timedelta(hours=24):
+            conn.close()
+            remaining = timedelta(hours=24) - (now - last_bonus_time)
+            hours, remainder = divmod(int(remaining.total_seconds()), 3600)
+            minutes, _ = divmod(remainder, 60)
+            return False, f"Бонус уже получен! Зайдите через {hours}ч {minutes}мин."
 
-TROLL_PHRASES = [
-    "Спорить с тобой — это как играть в шахматы с голубем.",
-    "Ты всегда такой умный или сегодня особенный день?",
-    "Ага, очень интересно, продолжай (нет).",
-    "Мнение принято, отправлено в корзину.",
-    "1000-7, гуль, получается?"
-]
+    cursor.execute("UPDATE users SET balance = balance + 220, last_bonus = ? WHERE user_id = ?", (now.isoformat(), user_id))
+    conn.commit()
+    conn.close()
+    return True, "🎉 Вы получили ежедневный бонус: +220 коинов!"
 
-# Функция фонового спама
-async def run_spam_task(chat_id: int, text: str, delay: float, conn_id: str):
-    try:
-        while True:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                business_connection_id=conn_id
-            )
-            if delay > 0:
-                await asyncio.sleep(delay)
-            else:
-                await asyncio.sleep(0.05)  # Небольшая пауза для стабильности event loop
-    except asyncio.CancelledError:
-        # Задача была отменена через .stop
-        pass
-
-# Главное меню
+# --- КЛАВИАТУРЫ ---
 def get_main_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="📖 Инструкция", callback_data="show_help"),
-            InlineKeyboardButton(text="🎮 Игра", callback_data="show_game_info")
-        ]
+        [InlineKeyboardButton(text="🎁 Ежедневный бонус (+220)", callback_data="claim_bonus")],
+        [InlineKeyboardButton(text="👤 Профиль / Вывод", callback_data="show_profile")]
     ])
 
-def get_rps_keyboard(chat_id: int):
+def get_rps_keyboard(game_id: str):
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🗿 Камень", callback_data=f"rps_rock_{chat_id}"),
-            InlineKeyboardButton(text="✂️ Ножницы", callback_data=f"rps_scissors_{chat_id}"),
-            InlineKeyboardButton(text="📄 Бумага", callback_data=f"rps_paper_{chat_id}")
+            InlineKeyboardButton(text="🗿 Камень", callback_data=f"choice_rock_{game_id}"),
+            InlineKeyboardButton(text="✂️ Ножницы", callback_data=f"choice_scissors_{game_id}"),
+            InlineKeyboardButton(text="📄 Бумага", callback_data=f"choice_paper_{game_id}")
         ]
     ])
 
-def get_post_game_keyboard(chat_id: int):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🎮 Сыграть ещё раз", callback_data=f"rps_restart_{chat_id}"),
-            InlineKeyboardButton(text="❌ Не хочу играть", callback_data=f"rps_cancel_{chat_id}")
-        ]
-    ])
+# Хранилище активных игр
+active_games = {}
 
+# --- ОБРАБОТЧИКИ КОМАНД ---
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    text = f"Привет! Бот успешно подключен и готов к работе в Telegram Business."
-    await message.answer(text, reply_markup=get_main_keyboard())
+    get_user(message.from_user.id, message.from_user.first_name)
+    text = (
+        f"Привет, {message.from_user.first_name}!\n\n"
+        "🎮 Напиши `.play` в чат, чтобы начать игру в **Камень, Ножницы, Бумага**.\n"
+        "💰 За победу: **+50 коинов**, за поражение: **-10 коинов**.\n"
+        "🧸 Накопи **50,000 коинов**, чтобы вывести Мишку за 15 звёзд!"
+    )
+    await message.answer(text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
 
-# Основной обработчик Telegram Business
-@dp.business_message()
-async def handle_business_message(message: Message):
-    global is_trolling, is_ghouling, active_games, afk_status, notes, active_spams
+@dp.message(F.text.startswith(".play"))
+async def start_game(message: Message):
+    user_id = message.from_user.id
+    user_name = message.from_user.first_name
+    get_user(user_id, user_name)
+
+    game_id = f"game_{message.chat.id}_{random.randint(1000, 9999)}"
+    active_games[game_id] = {
+        "players": {},
+        "status": "waiting"
+    }
+
+    text = (
+        "🎮 **Игра «Камень, ножницы, бумага» началась!**\n\n"
+        "Ждем 2 игроков. Нажмите на кнопку ниже, чтобы сделать выбор:"
+    )
+    await message.answer(text, reply_markup=get_rps_keyboard(game_id), parse_mode="Markdown")
+
+@dp.message(F.text.startswith(".bonus"))
+async def bonus_command(message: Message):
+    get_user(message.from_user.id, message.from_user.first_name)
+    success, msg = claim_daily_bonus(message.from_user.id)
+    await message.answer(msg, parse_mode="Markdown")
+
+@dp.message(F.text.startswith(".profile") | F.text.startswith(".withdraw"))
+async def profile_command(message: Message):
+    user = get_user(message.from_user.id, message.from_user.first_name)
+    balance = user[1]
     
-    chat_id = message.chat.id
-    text = (message.text or "").strip()
-    conn_id = message.business_connection_id
+    text = f"👤 **Ваш профиль:**\n💰 Баланс: **{balance} коинов**\n\n"
+    if balance >= 50000:
+        text += "🧸 **Поздравляем!** У вас достаточно коинов для вывода **Мишки за 15 звёзд**!"
+    else:
+        text += f"🎯 До вывода Мишки за 15 звёзд осталось: **{50000 - balance} коинов**."
+        
+    await message.answer(text, parse_mode="Markdown")
 
-    # Проверка: отправлено ли сообщение владельцем бизнес-аккаунта
-    is_outgoing = message.from_user.id == message.chat.id or message.is_from_offline
+# --- ОБРАБОТЧИКИ КНОПОК ---
+@dp.callback_query(F.data == "claim_bonus")
+async def bonus_callback(callback: CallbackQuery):
+    get_user(callback.from_user.id, callback.from_user.first_name)
+    success, msg = claim_daily_bonus(callback.from_user.id)
+    await callback.answer(msg, show_alert=True)
 
-    # 1. Если пишет собеседник (не вы)
-    if not is_outgoing:
-        if afk_status["active"] and not text.startswith("."):
-            await bot.send_message(
-                chat_id=chat_id,
-                text=f"💤 **Владелец сейчас AFK.**\nПричина: {afk_status['reason']}",
-                business_connection_id=conn_id,
-                parse_mode="Markdown"
-            )
-        elif is_trolling and not text.startswith("."):
-            await bot.send_message(
-                chat_id=chat_id,
-                text=random.choice(TROLL_PHRASES),
-                business_connection_id=conn_id
-            )
+@dp.callback_query(F.data == "show_profile")
+async def profile_callback(callback: CallbackQuery):
+    user = get_user(callback.from_user.id, callback.from_user.first_name)
+    balance = user[1]
+    
+    text = f"👤 Профиль:\n💰 Баланс: {balance} коинов\n\n"
+    if balance >= 50000:
+        text += "🧸 Вы можете забрать Мишку за 15 звёзд!"
+    else:
+        text += f"🎯 До Мишки осталось: {50000 - balance} коинов."
+        
+    await callback.answer(text, show_alert=True)
+
+@dp.callback_query(F.data.startswith("choice_"))
+async def process_choice(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    choice = parts[1]
+    game_id = f"{parts[2]}_{parts[3]}_{parts[4]}"
+    
+    user_id = callback.from_user.id
+    user_name = callback.from_user.first_name
+    get_user(user_id, user_name)
+
+    if game_id not in active_games:
+        await callback.answer("Эта игра уже завершена!", show_alert=True)
         return
 
-    # 2. Если команду пишете ВЫ (Владелец)
+    game = active_games[game_id]
 
-    # AFK Управление
-    if text.startswith(".afk"):
-        reason = text[4:].strip() or "Сплю"
-        afk_status["active"] = True
-        afk_status["reason"] = reason
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"💤 **Режим AFK включен.**\nПричина: {reason}",
-            business_connection_id=conn_id,
+    if user_id in game["players"]:
+        await callback.answer("Вы уже сделали выбор! Ждем второго игрока.", show_alert=True)
+        return
+
+    game["players"][user_id] = {"name": user_name, "choice": choice}
+    await callback.answer(f"Вы выбрали: {choice.upper()}!")
+
+    if len(game["players"]) == 1:
+        await callback.message.edit_text(
+            f"🎮 **Игра идет!**\n\nИгрок **{user_name}** сделал выбор.\nОжидаем второго игрока...",
+            reply_markup=get_rps_keyboard(game_id),
             parse_mode="Markdown"
         )
-        return
 
-    elif text == ".unafk":
-        afk_status["active"] = False
-        await bot.send_message(
-            chat_id=chat_id,
-            text="☀️ **Режим AFK выключен.**",
-            business_connection_id=conn_id,
-            parse_mode="Markdown"
-        )
-        return
+    elif len(game["players"]) == 2:
+        await callback.message.edit_text("⏳ Оба игрока сделали выбор! Подсчитываем результаты...")
+        
+        # Задержка 2 секунды перед оглашением результата
+        await asyncio.sleep(2)
 
-    # Управление спамом
-    elif text.startswith((".spamkiller", ".killerspam", ".spam")):
-        # Если в этом чате уже идет спам — останавливаем предыдущую задачу
-        if chat_id in active_spams and not active_spams[chat_id].done():
-            active_spams[chat_id].cancel()
+        players_list = list(game["players"].items())
+        p1_id, p1_data = players_list[0]
+        p2_id, p2_data = players_list[1]
 
-        if text.startswith(".spamkiller"):
-            msg = text[11:].strip()
-            delay = 0.0
-        elif text.startswith(".killerspam"):
-            msg = text[11:].strip()
-            delay = 0.1
+        c1, c2 = p1_data["choice"], p2_data["choice"]
+        choices_map = {"rock": "🗿 Камень", "scissors": "✂️ Ножницы", "paper": "📄 Бумага"}
+
+        if c1 == c2:
+            result_text = "🤝 **Ничья!** Баланс не изменился."
+        elif (c1 == "rock" and c2 == "scissors") or \
+             (c1 == "scissors" and c2 == "paper") or \
+             (c1 == "paper" and c2 == "rock"):
+            
+            update_balance(p1_id, 50)
+            update_balance(p2_id, -10)
+            result_text = (
+                f"🏆 Победил **{p1_data['name']}**! (+50 коинов)\n"
+                f"💔 **{p2_data['name']}** проиграл. (-10 коинов)"
+            )
         else:
-            msg = text[5:].strip()
-            delay = 1.5
-
-        if msg:
-            # Создаем независимую фоновую задачу для текущего чата
-            task = asyncio.create_task(run_spam_task(chat_id, msg, delay, conn_id))
-            active_spams[chat_id] = task
-        return
-
-    elif text == ".stop":
-        if chat_id in active_spams and not active_spams[chat_id].done():
-            active_spams[chat_id].cancel()
-            del active_spams[chat_id]
-            await bot.send_message(
-                chat_id=chat_id,
-                text="🛑 Спам остановлен.",
-                business_connection_id=conn_id
+            update_balance(p2_id, 50)
+            update_balance(p1_id, -10)
+            result_text = (
+                f"🏆 Победил **{p2_data['name']}**! (+50 коинов)\n"
+                f"💔 **{p1_data['name']}** проиграл. (-10 коинов)"
             )
-        return
 
-    # Дополнительные команды
-    elif text == ".cat":
-        async with aiohttp.ClientSession() as session:
-            async with session.get("https://api.thecatapi.com/v1/images/search") as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    await bot.send_photo(
-                        chat_id=chat_id,
-                        photo=data[0]["url"],
-                        caption="🐱 Вот твой случайный котик!",
-                        business_connection_id=conn_id
-                    )
-        return
+        final_msg = (
+            f"🎮 **Результаты дуэли:**\n\n"
+            f"👤 **{p1_data['name']}**: {choices_map[c1]}\n"
+            f"👤 **{p2_data['name']}**: {choices_map[c2]}\n\n"
+            f"{result_text}"
+        )
 
-    elif text == ".ghoul":
-        if is_ghouling: return
-        is_ghouling = True
-        val = 1000
-        while val > 0 and is_ghouling:
-            await bot.send_message(chat_id=chat_id, text=f"{val} - 7 = {val - 7}", business_connection_id=conn_id)
-            val -= 7
-            await asyncio.sleep(0.3)
-            if val < 7: break
-        if is_ghouling:
-            await bot.send_message(chat_id=chat_id, text="я гуль...", business_connection_id=conn_id)
-        is_ghouling = False
-        return
-
-    elif text == ".ghoulstop":
-        is_ghouling = False
-        await bot.send_message(chat_id=chat_id, text="🛑 **Цикл 1000-7 остановлен.**", business_connection_id=conn_id, parse_mode="Markdown")
-        return
-
-    elif text == ".a_troll":
-        is_trolling = not is_trolling
-        status = "включен 🎭" if is_trolling else "выключен 🛑"
-        await bot.send_message(chat_id=chat_id, text=f"Режим авто-троллинга **{status}**", business_connection_id=conn_id, parse_mode="Markdown")
-        return
+        await callback.message.edit_text(final_msg, parse_mode="Markdown")
+        del active_games[game_id]
 
 async def main():
+    init_db()
     logging.basicConfig(level=logging.INFO)
     await dp.start_polling(bot)
 
