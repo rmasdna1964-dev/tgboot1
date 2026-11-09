@@ -1,3 +1,0 @@
-aiogram
-aiofiles
-python-dotenv
